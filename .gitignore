@@ -61,3 +61,6 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# scratch build/compile-check trees used inside containers
+/.build-linux/

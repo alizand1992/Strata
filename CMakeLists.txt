@@ -458,6 +458,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(exchange_storage_test PROPERTIES TIMEOUT 60)
   endif()
 
+  # Option A Phase 2 (docs/plans/OPTION_A_EXCLUSIVE_RAM.md): the memory a CUDA engine and a HIP expert helper share.
+  # No CUDA include and no HIP include in it, so it is built the same way in both backends - which is the point of
+  # Gate 2: the same protocol has to survive the nvcc build and the hipcc build.
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/xhelper/protocol_test.cpp")
+    add_executable(xhelper_protocol_test tests/xhelper/protocol_test.cpp)
+    target_include_directories(xhelper_protocol_test PRIVATE include)
+    target_link_libraries(xhelper_protocol_test PRIVATE Threads::Threads)
+    add_test(NAME xhelper_protocol_test COMMAND xhelper_protocol_test)
+    set_tests_properties(xhelper_protocol_test PROPERTIES TIMEOUT 120)
+  endif()
+
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
     enable_testing()
     add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
