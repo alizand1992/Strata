@@ -85,5 +85,9 @@ node_modules/
 # screenshots and checkpoints from the Mac rebuild live outside git (StrataSplit\evidence-archive)
 /apps/host/docs/evidence/
 /apps/host/docs/checkpoints/
-# scratch build/compile-check trees used inside containers
+# docs/plans/OPTION_A_EXCLUSIVE_RAM.md Phase 1: the spike's binaries and the runs it prints (tools/xhelper_spike/run.sh)
+/tools/xhelper_spike/strata-xh-*
+/tools/xhelper_spike/results-*.txt
+
+# local container scratch for host-only compile checks
 /.build-linux/
