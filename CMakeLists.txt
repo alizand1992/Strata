@@ -561,6 +561,21 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
+  # Option A Phase 3 (docs/plans/OPTION_A_EXCLUSIVE_RAM.md): the HIP expert helper a CUDA engine forks next to it.
+  # HIP build only, and Linux only (its shared mapping is a memfd).  The parity test needs a pack (STRATA_TEST_PACK)
+  # and exits 77, skipped, without one.
+  if(STRATA_ENABLE_HIP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(strata-expert-helper src/xhelper/helper_main.cpp src/xhelper/helper_tier.cpp)
+    target_link_libraries(strata-expert-helper PRIVATE strata_engine)
+    if(STRATA_BUILD_TESTS)
+      add_executable(xhelper_helper_tier_parity tests/xhelper/helper_tier_parity.cpp src/xhelper/helper_tier.cpp)
+      target_include_directories(xhelper_helper_tier_parity PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/xhelper")
+      target_link_libraries(xhelper_helper_tier_parity PRIVATE strata_engine)
+      add_test(NAME xhelper_helper_tier_parity COMMAND xhelper_helper_tier_parity)
+      set_tests_properties(xhelper_helper_tier_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+    endif()
+  endif()
+
   if(STRATA_ENABLE_HIP)
     enable_testing()
     set(_strata_hip_tests)
