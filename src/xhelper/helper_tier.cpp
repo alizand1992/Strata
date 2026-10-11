@@ -100,7 +100,8 @@ void HelperTier::close() {
     h_out_ = d_x_ = d_out_ = z_x_ = z_rows_ = nullptr;
     d_q8_ = nullptr;
     d_scales_ = nullptr;
-    d_start_ = d_dst_ = d_tok_ = d_count_ = d_ptr_ = nullptr;
+    d_start_ = d_dst_ = d_tok_ = d_count_ = nullptr;
+    d_ptr_ = nullptr;
     shared_x_ = shared_rows_ = nullptr;
     registered_x_ = registered_rows_ = false;
     zero_copy_ = false;
