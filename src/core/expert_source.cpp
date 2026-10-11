@@ -3063,6 +3063,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
             std::memset(out + (size_t) i * (size_t) n_embd, 0, (size_t) n_embd * sizeof(float));
             continue;
         }
+        if (!d.src->pinned(d.layers, e)) ++d.pool_unpinned_blobs;
         const uint8_t* b = d.src->blob(d.layers, e);
         if (b == nullptr) {
             // The one failure the loop cannot see.  Leaving `out` at its previous contents would feed the NEXT
@@ -3116,7 +3117,26 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     if (d.external != nullptr) {
         static thread_local std::string external_error;
         if (!d.external->finish(out, external_error)) {
-            d.failed = true; d.fail = external_error.c_str(); d.fail_layer = d.layers; return;
+            // The helper stopped in this layer: its rows are computed here from the files, as in the window path.
+            int64_t nfb = 0;
+            for (int64_t i = 0; i < k; ++i) {
+                if (!d.external->owns(i)) continue;
+                const uint8_t* b = d.src->blob(d.layers, ids[i]);
+                if (b == nullptr) {
+                    d.failed = true; d.fail = external_error.c_str(); d.fail_layer = d.layers; d.fail_expert = ids[i]; ++d.missing;
+                    return;
+                }
+                ExpertJob& j = d.jobs[(size_t) nfb++];
+                j.blob = b;
+                j.act = &d.act;
+                j.out = out + (size_t) i * (size_t) n_embd;
+                j.weight = 1.0f;
+                j.slot = (int) i;
+            }
+            if (nfb > 0) {
+                if (d.split_rows) d.pool->run_split(d.jobs.data(), (int) nfb);
+                else d.pool->run(d.jobs.data(), (int) nfb);
+            }
         }
     }
     ++d.layers;
@@ -3359,6 +3379,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++d.cache_refused;
             int16_t& jo = d.job_of[(size_t) e];
             if (jo < 0) {
+                if (!d.src->pinned(d.layers, e)) ++d.pool_unpinned_blobs;
                 const uint8_t* b = d.src->blob(d.layers, e);
                 if (b == nullptr) {
                     d.failed = true;
@@ -3396,7 +3417,46 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.external != nullptr) {
         static thread_local std::string external_error;
         if (!d.external->finish(out, external_error)) {
-            d.failed = true; d.fail = external_error.c_str(); d.fail_layer = d.layers; return;
+            // The helper stopped in this layer (ExternalExperts logged why, once).  The rows it owned are computed here
+            // from the model files, so the window, the request and the engine go on; from the next layer on it owns
+            // nothing.  Failing the window instead ends the engine in serve mode (a pool failure there is fatal).
+            for (int64_t t = 0; t < n_tok; ++t) {
+                if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))
+                    act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+                else if (native)
+                    native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
+                else
+                    act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+            }
+            int32_t job_expert[kMaxWindowEntries];
+            int nfb = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                if (!d.external->owns(i)) continue;
+                const int32_t e = ids[i];
+                int j = 0;
+                while (j < nfb && job_expert[j] != e) ++j;
+                if (j == nfb) {
+                    const uint8_t* b = d.src->blob(d.layers, e);
+                    if (b == nullptr) {
+                        d.failed = true; d.fail = external_error.c_str(); d.fail_layer = d.layers; d.fail_expert = e; ++d.missing;
+                        return;
+                    }
+                    job_expert[nfb] = e;
+                    d.jobs_multi[(size_t) nfb].blob = b;
+                    d.jobs_multi[(size_t) nfb].nt = 0;
+                    ++nfb;
+                }
+                ExpertJobMulti& jb = d.jobs_multi[(size_t) j];
+                const int64_t t = i / k;
+                jb.act[jb.nt] = &d.act_multi[(size_t) t];
+                jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
+                jb.out[jb.nt] = out + (size_t) i * H;
+                ++jb.nt;
+            }
+            if (nfb > 0) {
+                if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), nfb);
+                else d.pool->run_split_multi(d.jobs_multi.data(), nfb);
+            }
         }
     }
     if (d.peer != nullptr) {                 // multi-GPU: the second GPU's rows, into the same mapped rows
