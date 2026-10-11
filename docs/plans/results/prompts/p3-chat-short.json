@@ -1,0 +1,12 @@
+{
+ "model": "strata",
+ "messages": [
+  {
+   "role": "user",
+   "content": "What is the difference between a mutex and a semaphore? Answer in a few short paragraphs."
+  }
+ ],
+ "temperature": 0,
+ "max_tokens": 512,
+ "stream": false
+}
