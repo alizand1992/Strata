@@ -13,6 +13,7 @@
 #include "helper_tier.hpp"
 
 #include "strata/core/expert_source.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/xhelper/protocol.hpp"
 
 #include <cuda_runtime.h>
@@ -131,11 +132,17 @@ int main(int argc, char** argv) {
         return 3;
     }
 
-    // The same mmap path the engine uses (src/program/generate.cpp), which also initialises
-    // strata::kernels::cpu::expert_layout() the kernels need.
+    // The same path the engine takes (src/program/generate.cpp): load the pack's expert layout, which the kernels and
+    // FileExpertSource::open both need, then open the source on it.
+    std::string err;
+    if (!strata::kernels::cpu::expert_layout_load(hdr->model_pack, hdr->n_layers, hdr->n_expert, err)) {
+        std::snprintf(hdr->error, sizeof(hdr->error), "%.511s", err.c_str());
+        hdr->helper_state.store((uint32_t) HelperState::Failed, std::memory_order_release);
+        std::fprintf(stderr, "helper: loading the pack's expert layout failed: %s\n", err.c_str());
+        return 3;
+    }
     strata::core::FileExpertSource source;
     source.set_gguf(hdr->native_preset);
-    std::string err;
     if (!source.open(hdr->model_pack, hdr->n_layers, hdr->n_expert, err)) {
         std::snprintf(hdr->error, sizeof(hdr->error), "%.511s", err.c_str());
         hdr->helper_state.store((uint32_t) HelperState::Failed, std::memory_order_release);

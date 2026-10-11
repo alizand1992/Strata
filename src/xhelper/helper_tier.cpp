@@ -13,6 +13,7 @@
 #include "strata/xhelper/protocol.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace strata::xhelper {
@@ -217,7 +218,11 @@ bool HelperTier::open(int device, uint64_t vram_budget_bytes, int64_t n_layers, 
         check(cudaHostAlloc(&h_meta_, meta_bytes, cudaHostAllocPortable), "metadata staging", err);
     if (!allocated) { close(); return false; }
 
-    zero_copy_ = registered_x_ && registered_rows_ &&
+    // STRATA_XHELPER_STAGED=1 takes the staged path even where zero-copy works: the A/B for the parity test and the
+    // round trip.
+    const char* staged_env = std::getenv("STRATA_XHELPER_STAGED");
+    const bool force_staged = staged_env && staged_env[0] == '1';
+    zero_copy_ = !force_staged && registered_x_ && registered_rows_ &&
                  cudaHostGetDevicePointer((void**) &z_x_, shared_x_, 0) == cudaSuccess &&
                  cudaHostGetDevicePointer((void**) &z_rows_, shared_rows_, 0) == cudaSuccess;
     ignore(cudaGetLastError());
@@ -227,6 +232,8 @@ bool HelperTier::open(int device, uint64_t vram_budget_bytes, int64_t n_layers, 
         if (!check(cudaHostAlloc((void**) &h_out_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped),
                    "result staging", err)) { close(); return false; }
     }
+    // The group metadata is uploaded even with zero-copy: every block of every kernel reads it, and reading it across
+    // the link from pinned memory measured 10-50 us slower per request than the one 1.6 KB copy (x4 Gen3, 2026-10-11).
     auto* meta = (HelperMeta*) d_meta_;
     d_ptr_ = meta->ptr;
     d_start_ = meta->start;
