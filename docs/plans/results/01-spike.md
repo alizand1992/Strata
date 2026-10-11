@@ -132,6 +132,9 @@ work. The checksum read-back is the spike's, not the design's, but without it th
   activations come over PCIe would sit at the same ~150 us floor. The plan's stop rule (p99 above 500 us) does not
   fire. Options: continue on this box with zero-copy as the transfer design and accept ~150 us x 48 layers per window;
   run the spike on the X570 box (x8/x8 Gen4, ~4x the link) before deciding; or stop Option A on the B550.
+- Owner's decision (2026-10-11): **continue on the B550 with zero-copy** as the transfer design, accepting the
+  missing margin. Phase 3's helper already took zero-copy when registration works; its numbers with real experts are
+  in [03-helper.md](03-helper.md).
 
 ## Changes to the spike
 
