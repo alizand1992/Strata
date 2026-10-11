@@ -12444,6 +12444,8 @@ int main(int argc, char** argv) {
             const int64_t x_rows0 = external.computed(), x_layers0 = external.launched_layers(),
                           x_timeouts0 = external.timeouts(), x_waited0 = external.waited_layers();
             const double x_begin0 = external.ms_begin(), x_wait0 = external.ms_wait();
+            const int64_t unpinned0 = drive.d.pool_unpinned_blobs;
+            const int64_t cpu_entries0 = drive.d.multi_entries;
             cur = ids;
             const Clock::time_point r0 = Clock::now();
             const int64_t streamed0 = sp.chain_experts_streamed();   // the DONE line's experts_streamed= is the difference
@@ -15467,6 +15469,11 @@ int main(int argc, char** argv) {
             if (src.ram_adapts() > 0)   // STRATA_RAM_ADAPT, cumulative
                 std::fprintf(stderr, "strata serve: resident RAM: %lld experts moved in from the file in place of "
                                      "unused ones (STRATA_RAM_ADAPT)\n", (long long) src.ram_adapts());
+            // Option A Phase 6: what the CPU pool (decode and verify windows only, not the prompt path) took from
+            // outside the page-locked RAM copy in this request - the file tier's share of decode
+            if (src.complement_ready())
+                std::fprintf(stderr, "strata serve: decode pool: %lld expert blobs from outside the RAM copy this request\n",
+                             (long long) (drive.d.pool_unpinned_blobs - unpinned0));
             if (ajob)   // --adapt-async, cumulative (a round may still be in flight: it lands before the next request)
                 std::fprintf(stderr, "strata serve: asynchronous adaptive tier: %lld rounds, %lld experts swapped in, "
                                      "%.1f ms per round (start to flip, between windows)",
@@ -15619,11 +15626,11 @@ int main(int argc, char** argv) {
                 int64_t trips = 0;
                 const bool traced = external.take_round_trips(p50, p99, trips);
                 std::fprintf(stderr, "strata serve: external: %lld rows, %lld layers, begin %.1f ms, wait %.1f ms, "
-                                     "%lld layers waited on the helper, timeouts %lld%s",
+                                     "%lld layers waited on the helper, timeouts %lld; CPU pool %lld entries%s",
                              (long long) (external.computed() - x_rows0), (long long) (external.launched_layers() - x_layers0),
                              external.ms_begin() - x_begin0, external.ms_wait() - x_wait0,
                              (long long) (external.waited_layers() - x_waited0), (long long) (external.timeouts() - x_timeouts0),
-                             external.alive() ? "" : " (the helper has stopped)");
+                             (long long) (drive.d.multi_entries - cpu_entries0), external.alive() ? "" : " (the helper has stopped)");
                 if (traced) std::fprintf(stderr, "; round trip p50 %.0f us p99 %.0f us over %lld layers", p50, p99, (long long) trips);
                 std::fprintf(stderr, "\n");
             }
