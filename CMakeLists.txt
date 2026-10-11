@@ -443,7 +443,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
-  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp src/core/external_experts.cpp
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
@@ -564,6 +564,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # Option A Phase 3 (docs/plans/OPTION_A_EXCLUSIVE_RAM.md): the HIP expert helper a CUDA engine forks next to it.
   # HIP build only, and Linux only (its shared mapping is a memfd).  The parity test needs a pack (STRATA_TEST_PACK)
   # and exits 77, skipped, without one.
+  # Option A Phase 4: the engine side against a real helper (CUDA build, Linux).  Needs STRATA_TEST_PACK,
+  # STRATA_TEST_NATIVE and STRATA_TEST_HELPER (a HIP build's strata-expert-helper); exits 77, skipped, without them.
+  if(STRATA_BUILD_TESTS AND NOT STRATA_ENABLE_HIP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(xhelper_external_experts_test tests/xhelper/external_experts_test.cpp)
+    target_link_libraries(xhelper_external_experts_test PRIVATE strata_engine)
+    add_test(NAME xhelper_external_experts_test COMMAND xhelper_external_experts_test)
+    set_tests_properties(xhelper_external_experts_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+  endif()
   if(STRATA_ENABLE_HIP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(strata-expert-helper src/xhelper/helper_main.cpp src/xhelper/helper_tier.cpp)
     target_link_libraries(strata-expert-helper PRIVATE strata_engine)

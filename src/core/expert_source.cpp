@@ -3,6 +3,7 @@
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/remote_experts.hpp"
+#include "strata/core/external_experts.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -1988,6 +1989,7 @@ void RouterLookahead::run() {
             for (int j = 0; j < k_; ++j) {
                 const int64_t e = order[(size_t) j];
                 if (host_res != nullptr && host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;   // on the GPU
+                if (skip_ != nullptr && skip_[(size_t) (layer * n_expert_ + e)]) continue;            // on the helper
                 if (std::find(want.begin(), want.end(), e) == want.end()) want.push_back(e);
             }
         }
@@ -3030,6 +3032,23 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
             }
     }
+    if (d.external != nullptr) {
+        int32_t kind[32];
+        if (k > 32) {
+            d.failed = true; d.fail = "external experts: routing width exceeds 32"; return;
+        }
+        for (int64_t i = 0; i < k; ++i) {
+            bool taken = false;
+            for (int r = 0; r < d.remote_count; ++r) taken |= d.remote[r]->owns(i);
+            kind[i] = taken || (use_hits && ids[i] >= 0 && ids[i] < d.n_expert && (graph_hits
+                ? d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] >= 0
+                : d.is_hit[(size_t) i] != 0)) ? 0 : -1;
+        }
+        static thread_local std::string external_error;
+        if (!d.external->begin(d.layers, x_f, ids, 1, k, kind, d.host_res, external_error)) {
+            d.failed = true; d.fail = external_error.c_str(); d.fail_layer = d.layers; return;
+        }
+    }
 
     for (int64_t i = 0; i < k; ++i) {
         const int64_t e = ids[i];
@@ -3039,6 +3058,10 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
             d.fail_layer = d.layers;
             d.fail_expert = e;
             return;
+        }
+        if (d.external != nullptr && d.external->owns(i)) {   // the helper's row: no blob read from the files
+            std::memset(out + (size_t) i * (size_t) n_embd, 0, (size_t) n_embd * sizeof(float));
+            continue;
         }
         const uint8_t* b = d.src->blob(d.layers, e);
         if (b == nullptr) {
@@ -3089,6 +3112,12 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
             if (!d.remote[r]->finish(out, remote_error)) {
                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
             }
+    }
+    if (d.external != nullptr) {
+        static thread_local std::string external_error;
+        if (!d.external->finish(out, external_error)) {
+            d.failed = true; d.fail = external_error.c_str(); d.fail_layer = d.layers; return;
+        }
     }
     ++d.layers;
     d.experts += k;
@@ -3150,7 +3179,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         auto helper_holds = [&](int32_t e) {
             for (int r = 0; r < d.remote_count; ++r)
                 if (d.remote[r]->holds(d.layers, e)) return true;
-            return false;
+            return d.external != nullptr && d.external->holds(d.layers, e);
         };
         for (int64_t i = 0; i < n; ++i) {
             first_of[i] = i;
@@ -3264,6 +3293,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
         }
     }
+    if (d.external != nullptr) {   // after the remote tiers: what they claimed is kind 2 already, not a candidate
+        static thread_local std::string external_error;
+        if (!d.external->begin(d.layers, x_f, ids, n_tok, k, kind, d.host_res, external_error)) {
+            d.failed = true; d.fail = external_error.c_str(); d.fail_layer = d.layers; return;
+        }
+        for (int64_t i = 0; i < n; ++i) if (d.external->owns(i)) kind[i] = 2;
+    }
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     // the GPU's copy_rows_from_mapped zeroes the rows it computed itself (dec_batch); STRATA_VERIFY_DEVICE_PLAN's
     // copy_or_zero_from_mapped copies every row, so there the host still zeroes them
@@ -3356,6 +3392,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (!d.remote[r]->finish(out, remote_error)) {
                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
             }
+    }
+    if (d.external != nullptr) {
+        static thread_local std::string external_error;
+        if (!d.external->finish(out, external_error)) {
+            d.failed = true; d.fail = external_error.c_str(); d.fail_layer = d.layers; return;
+        }
     }
     if (d.peer != nullptr) {                 // multi-GPU: the second GPU's rows, into the same mapped rows
         std::string perr;

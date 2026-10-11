@@ -28,6 +28,7 @@
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
+#include "strata/core/external_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/layer.hpp"
@@ -446,6 +447,12 @@ struct Options {
     std::array<bool, 3> expert_cache_remote_auto{};
     bool remote_expert_opt = false; ///< optional optimization of the existing remote-expert decode path
     std::string expert_cache_remote_placement = "stripe"; ///< stripe experts or assign complete layers to CUDA1..3
+    /// Option A (docs/plans/OPTION_A_EXCLUSIVE_RAM.md): strata-expert-helper, a HIP build on an AMD card, computes the
+    /// CPU candidates it holds.  Empty = off.
+    std::string external_experts;
+    int external_experts_device = 0;      ///< HIP device index for the helper
+    double external_experts_gib = 0;      ///< VRAM budget on the helper; 0 = its free VRAM minus headroom
+    std::string external_experts_ram = "exclusive";   ///< exclusive: the helper's experts leave the RAM copy
     bool expert_cache_cpu_order = false;
     /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
     /// The default policy hands out slots in arrival order from one counter shared by all 48 layers, so the
@@ -823,6 +830,12 @@ void usage() {
                  "  --remote-expert-opt   enable remote-expert decode optimizations (serve mode)\n"
                  "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
                  "                       layers across CUDA1..3 (default: stripe)\n"
+                 "  --external-experts PATH  strata-expert-helper (a HIP build): an AMD card next to this CUDA\n"
+                 "                       engine holds experts and computes the CPU's rows it holds (Linux)\n"
+                 "  --external-experts-device N  the helper's HIP device (default 0)\n"
+                 "  --external-experts-gib X  VRAM the helper fills (default 0: what is free)\n"
+                 "  --external-experts-ram exclusive|inclusive  leave the helper's experts out of the RAM\n"
+                 "                       copy, or keep them in it too (default: exclusive)\n"
                  "  --peer-device N      a second GPU as an adaptive expert-cache tier (rows over P2P; it also\n"
                  "                       computes its experts' prompt rows).  Not with --layer-split or\n"
                  "                       --expert-cache-device1..3.  Default output unchanged without it.\n"
@@ -1763,6 +1776,10 @@ int main(int argc, char** argv) {
         else if (a == "--remote-expert-opt") o.remote_expert_opt = true;
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
+        else if (a == "--external-experts") o.external_experts = next("--external-experts");
+        else if (a == "--external-experts-device") o.external_experts_device = std::atoi(next("--external-experts-device"));
+        else if (a == "--external-experts-gib") o.external_experts_gib = std::atof(next("--external-experts-gib"));
+        else if (a == "--external-experts-ram") o.external_experts_ram = next("--external-experts-ram");
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
         else if (a == "--vram-reserve-later-mib")
             o.vram_reserve_later_mib = std::atoi(next("--vram-reserve-later-mib"));
@@ -2325,6 +2342,34 @@ int main(int argc, char** argv) {
     if (o.remote_expert_opt && !o.serve) {
         std::fprintf(stderr, "strata generate: --remote-expert-opt requires --serve\n");
         return 2;
+    }
+    if (!o.external_experts.empty()) {
+        // one request in flight, one helper, the primary's own cache and RAM copy: what each of these changes is a
+        // second owner of a row, a second request in flight, or a cache that moves under the helper's offer
+        const char* why = o.external_experts_ram != "exclusive" && o.external_experts_ram != "inclusive"
+                              ? "--external-experts-ram must be exclusive or inclusive"
+                        : o.external_experts_device < 0 || o.external_experts_gib < 0 ? "a negative helper device or budget"
+                        : o.expert_cache_remote[0] > 0 ? "not with --expert-cache-device1..3"
+                        : o.remote_expert_opt ? "not with --remote-expert-opt"
+                        : o.peer_device >= 1 ? "not with --peer-device"
+                        : !o.layer_split.empty() ? "not with --layer-split"
+                        : o.batch != 0 ? "not with --batch"
+                        : o.pipeline_windows >= 2 ? "not with --pipeline-windows 2"
+                        : o.vram_elastic ? "not with --vram-elastic"
+                        : o.kv_grow ? "not with --kv-grow"
+                        : o.expert_profile.empty() ? "it needs --expert-profile"
+                        : o.no_pool ? "it needs the expert pool"
+#if defined(STRATA_USE_HIP)
+                        : true ? "it needs the CUDA engine (this is the HIP build; the helper is the HIP side)"
+#endif
+#if !defined(__linux__)
+                        : true ? "it runs on Linux only"
+#endif
+                        : nullptr;
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: --external-experts: %s\n", why);
+            return 2;
+        }
     }
     // the peer tier is the second card's only user: a layer split or a remote expert cache would put a second engine
     // part (and a second copy of the same experts) on it
@@ -4932,13 +4977,53 @@ int main(int argc, char** argv) {
                      (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
     }
 
+    // ---- Option A (--external-experts): the HIP helper's tier, filled before the RAM copy is built so that an
+    // exclusive copy can leave its experts out.  The offer is the remote tiers' ranking: the profile, then every
+    // unranked pair in expert-then-layer order; the helper takes what fits, in that order.
+    strata::core::ExternalExperts external;
+    if (!o.external_experts.empty()) {
+        if (o.expert_cache <= 0 || profile.empty() || srcp == nullptr) {
+            std::fprintf(stderr, "strata generate: --external-experts needs --expert-profile and the expert cache\n");
+            return 2;
+        }
+        std::vector<std::pair<int32_t, int32_t>> ranked = profile;
+        std::vector<uint8_t> seen((size_t) g.n_layers * (size_t) g.n_expert, 0);
+        for (const auto& pair : ranked)
+            if (pair.first >= 0 && pair.first < g.n_layers && pair.second >= 0 && pair.second < g.n_expert)
+                seen[(size_t) pair.first * (size_t) g.n_expert + (size_t) pair.second] = 1;
+        for (int64_t e = 0; e < g.n_expert; ++e)
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                if (!seen[(size_t) l * (size_t) g.n_expert + (size_t) e]) ranked.emplace_back((int32_t) l, (int32_t) e);
+        strata::core::ExternalExperts::Options xo;
+        xo.helper_exe = o.external_experts;
+        xo.hip_device = o.external_experts_device;
+        xo.vram_budget = (uint64_t) (o.external_experts_gib * 1073741824.0);
+        xo.inclusive_ram = o.external_experts_ram == "inclusive";
+        auto env_u = [](const char* name, long fallback) { const char* v = std::getenv(name); return v && v[0] ? std::atol(v) : fallback; };
+        xo.spin_us = (uint32_t) env_u("STRATA_XH_SPIN_US", 200);
+        xo.timeout_ms = (int) env_u("STRATA_XH_TIMEOUT_MS", 2000);
+        xo.trace = env_u("STRATA_XH_TRACE", 0) != 0;
+        if (!external.open(xo, o.pack, o.native_preset, g.n_layers, g.n_expert, ranked, xcache, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: external helper (HIP device %d): %lld experts, %.2f GiB, loaded in %.1f s; "
+                             "with CUDA0's %lld that is %lld of %lld on the GPUs; RAM copy %s\n",
+                     o.external_experts_device, (long long) external.loaded().size(), external.gib(), external.load_seconds(),
+                     (long long) xcache.slots(), (long long) (xcache.slots() + (int64_t) external.loaded().size()),
+                     (long long) (g.n_layers * g.n_expert), xo.inclusive_ram ? "inclusive (keeps them too)" : "exclusive (leaves them out)");
+    }
+
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     Drive drive;
     // #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tiers leave an expert a helper GPU holds out of the primary's
     // promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache (RemoteExperts::holds,
     // #854), so an expert the helper's tier swaps in or out later is followed - never a copy taken at load.
     const bool disjoint_adapt = [] { const char* v = std::getenv("STRATA_DISJOINT_ADAPT"); return v != nullptr && std::atoi(v) != 0; }();
+    // Option A: an expert the external helper holds is never promoted into the primary's cache, whatever the switch
+    // says: in exclusive mode it is not in the RAM copy, so the exchange would have no `in` to take from RAM.
     auto helper_holds = [&](int64_t l, int32_t e) -> bool {
+        if (external.valid() && external.held_mask()[(size_t) l * (size_t) g.n_expert + (size_t) e]) return true;   // also after it stopped
         if (!disjoint_adapt) return false;
         for (int r = 0; r < drive.d.remote_count; ++r)
             if (drive.d.remote[r]->holds(l, e)) return true;
@@ -4946,6 +5031,7 @@ int main(int argc, char** argv) {
     };
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
+    drive.d.external = external.valid() ? &external : nullptr;
     drive.d.peer = peer.valid() ? &peer : nullptr;
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
     drive.d.split_rows = !o.no_split_rows;
@@ -4974,6 +5060,7 @@ int main(int argc, char** argv) {
             ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
         }
         const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
+        if (external.valid()) lookahead.set_skip(external.held_mask());   // Option A: the helper's are not the CPU's to read
         if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, srcp, err, fs_ahead)) {
             drive.d.lookahead = &lookahead;
             if (const char* dv = std::getenv("STRATA_IO_PREFETCH_DEPTH"); dv != nullptr && std::atoi(dv) > 0)
@@ -6102,6 +6189,10 @@ int main(int argc, char** argv) {
             for (int64_t l = st->lb; l < st->le; ++l)
                 for (int64_t e = 0; e < g.n_expert; ++e)
                     if (st->cache.slot_of(l, e) >= 0) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
+        // Option A, exclusive: the helper's experts are not copied into RAM either (the CPU never computes them while
+        // the helper answers; if it stops, they are read from the model files)
+        if (external.valid() && !external.inclusive_ram())
+            stage_pairs.insert(stage_pairs.end(), external.loaded().begin(), external.loaded().end());
         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
                                                     o.resident_headroom, o.resident_budget, &rank_all);
@@ -9093,6 +9184,9 @@ int main(int argc, char** argv) {
                 begin_before[(size_t) r] = remote_experts[(size_t) r].ms_begin();
                 wait_before[(size_t) r] = remote_experts[(size_t) r].ms_wait();
             }
+            const int64_t x_rows0 = external.computed(), x_layers0 = external.launched_layers(),
+                          x_timeouts0 = external.timeouts(), x_waited0 = external.waited_layers();
+            const double x_begin0 = external.ms_begin(), x_wait0 = external.ms_wait();
             cur = ids;
             const Clock::time_point r0 = Clock::now();
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
@@ -11118,6 +11212,19 @@ int main(int argc, char** argv) {
                              (double) (remote_experts[(size_t) r].full_row_bytes() - full_before[(size_t) r]) / 1048576.0,
                              remote_experts[(size_t) r].ms_begin() - begin_before[(size_t) r],
                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
+            if (external.valid()) {
+                double p50 = 0, p99 = 0;
+                int64_t trips = 0;
+                const bool traced = external.take_round_trips(p50, p99, trips);
+                std::fprintf(stderr, "strata serve: external: %lld rows, %lld layers, begin %.1f ms, wait %.1f ms, "
+                                     "%lld layers waited on the helper, timeouts %lld%s",
+                             (long long) (external.computed() - x_rows0), (long long) (external.launched_layers() - x_layers0),
+                             external.ms_begin() - x_begin0, external.ms_wait() - x_wait0,
+                             (long long) (external.waited_layers() - x_waited0), (long long) (external.timeouts() - x_timeouts0),
+                             external.alive() ? "" : " (the helper has stopped)");
+                if (traced) std::fprintf(stderr, "; round trip p50 %.0f us p99 %.0f us over %lld layers", p50, p99, (long long) trips);
+                std::fprintf(stderr, "\n");
+            }
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
         return 0;

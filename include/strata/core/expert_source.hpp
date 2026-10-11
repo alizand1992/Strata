@@ -47,6 +47,7 @@ namespace strata::core {
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
+class ExternalExperts;   // Option A: a HIP helper process on another vendor's GPU (external_experts.hpp)
 struct LoadStats;
 
 namespace detail {
@@ -234,6 +235,9 @@ public:
     /// STRATA_IO_PREFETCH_DEPTH: how many layers ahead of `layer` are predicted and warmed (default 1, the next layer).
     /// A deeper one predicts layer + j from layer's input, which is less exact the further it looks.
     void set_depth(int d) { depth_ = d < 1 ? 1 : d > 4 ? 4 : d; }
+    /// A layer * n_expert + expert byte mask of experts never to warm (the external helper's, which the CPU does not
+    /// read while the helper answers).  Set before start(); null = none.
+    void set_skip(const uint8_t* mask) { skip_ = mask; }
     int depth() const { return depth_; }
     int64_t predicted() const { return predicted_.load(std::memory_order_relaxed); }
     int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
@@ -253,6 +257,7 @@ private:
     int64_t layer_ = -1, n_tok_ = 0;
     const int32_t* host_res_ = nullptr;
     ForesightSwap* fs_ = nullptr;                   ///< (under mu_)
+    const uint8_t* skip_ = nullptr;
     std::vector<float> x_;
     std::atomic<int64_t> predicted_{0}, skipped_{0};
     std::atomic<uint64_t> busy_us_{0};
@@ -295,6 +300,9 @@ struct ExpertDispatch {
     RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts
     RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
     int remote_count = 0;
+    /// Option A (--external-experts): the helper process's tier, asked after the remote tiers, so a row has one owner.
+    /// Null leaves every path as it was.
+    ExternalExperts* external = nullptr;
     int64_t n_expert = strata::kernels::cpu::NE;
 
     /// Counters, for the driver to report rather than for control flow.
