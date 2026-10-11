@@ -4,7 +4,8 @@
 Branch `xhelper/p2-protocol`.
 
 Gate 2 says: **the test passes under ctest in the CUDA build and in the HIP build.** Half of that is measured here,
-half needs the box the plan targets. What follows is what was actually run, on the machines available while writing.
+half needs the box the plan targets. The first sections are from the machines available while writing; "Gate 2"
+below is the run on the box.
 
 ## What is in the header
 
@@ -75,15 +76,57 @@ the parenthesised row is the same test compiled by ROCm 6.4's clang++ on emulate
 
 ## Gate 2
 
-**Not closed.** The test is in ctest and green in a CUDA configure on the plan's arch, and the same file compiles clean
-under `hipcc 6.4` and runs green when linked by that toolchain's host compiler. What is missing is the HIP **build**
-(`-DSTRATA_ENABLE_HIP=ON` through `cmake/hip_backend.cmake`) on the box with the 9060 XT. Run there:
+**Closed on 2026-10-10**, on the plan's box: B550 Tomahawk MAX, Ryzen 9 3900X, 32 GB, Ubuntu 24.04, kernel
+7.0.0-38. Branch `xhelper/p3-helper` at `93f9376` (the test and header are unchanged from `xhelper/p2-protocol`).
+
+**CUDA build** (CUDA 13.0.88, g++ 13.3.0, setup's flags plus tests):
 
 ```sh
-cmake -S . -B build-hip -DSTRATA_ENABLE_HIP=ON -DSTRATA_BUILD_TESTS=ON -DCMAKE_HIP_ARCHITECTURES=gfx1200
-cmake --build build-hip --target xhelper_protocol_test -j
-ctest --test-dir build-hip -R xhelper_protocol_test --output-on-failure
+cmake -G Ninja -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON \
+      -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+      -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp
+cmake --build build-cuda --target xhelper_protocol_test
+ctest --test-dir build-cuda -R xhelper_protocol_test --output-on-failure
+    1/1 Test #8: xhelper_protocol_test ............   Passed    1.07 sec
 ```
+
+**HIP build** (ROCm 7.10.0a20251120 from TheRock wheels in `.venv`, as setup installs it; AMD clang 22.0.0git; setup's
+`build_engine_hip` flags plus tests):
+
+```sh
+cmake -G Ninja -S . -B build-hip -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
+      -DSTRATA_BUILD_TESTS=ON -DSTRATA_PREFILL_MMQ=ON -DCMAKE_HIP_ARCHITECTURES=gfx1200 \
+      -DCMAKE_HIP_COMPILER=$R/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=$R -DCMAKE_PREFIX_PATH="$R;$L" \
+      -DCMAKE_HIP_FLAGS="--rocm-path=$R --rocm-device-lib-path=$R/lib/llvm/amdgcn/bitcode \
+                         --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13" \
+      -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp
+#   R = .venv/lib/python3.12/site-packages/_rocm_sdk_devel, L = ..._rocm_sdk_libraries_gfx120X_all
+cmake --build build-hip --target xhelper_protocol_test
+ctest --test-dir build-hip -R xhelper_protocol_test --output-on-failure
+    1/1 Test #6: xhelper_protocol_test ............   Passed    0.94 sec
+```
+
+`--gcc-install-dir` is needed on this box and is **not** something setup passes: clang 22 picks
+`/usr/lib/gcc/x86_64-linux-gnu/14`, which has no C++ headers here (only `libstdc++-13-dev` is installed), and CMake's HIP
+compiler check then fails with "Could not find standard C++ header 'cmath'". So `./setup.sh --backend hip` would fail
+the same way on this box. The other fix is `sudo apt install libstdc++-14-dev`. This is a setup issue, separate from
+this plan.
+
+Numbers from the test binary on this box (3900X; the protocol test has no GPU in it):
+
+| Case | Build | p50 | p99 | p99.9 |
+|---|---|---|---|---|
+| transport alone, one row each way, 20000 rounds | CUDA | 1.94 µs | 2.54 µs | 5.79 µs |
+| | HIP | 0.88 µs | 2.54 µs | 5.71 µs |
+| full request, up to 80 rows of 2560 floats, 20000 rounds | CUDA (3 runs) | 16.0-21.5 µs | 68.3-79.9 µs | 80.6-89.5 µs |
+| | HIP | 15.55 µs | 48.56 µs | 79.80 µs |
+| same, both sides parked in the futex, no spin, 2000 rounds | CUDA (3 runs) | 22.8-26.5 µs | 66.9-85.2 µs | 85.0-89.2 µs |
+| | HIP | 51.56 µs | 90.59 µs | 105.13 µs |
+
+0 timeouts and 0 mismatches in every row. With no partner the wait gave up after 151.3-151.4 ms of the 150 ms window.
+Both builds compile this file with the same host compiler (g++ 13.3, the HIP build's `CMAKE_CXX_COMPILER` is
+`/usr/bin/c++`), so the CUDA and HIP rows differ only by run-to-run noise. The llama-server described in
+`00-preflight.md` was running on ~6 cores during these runs.
 
 ## Not tested
 
