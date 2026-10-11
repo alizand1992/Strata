@@ -76,3 +76,31 @@ Per-request helper lines (pass 1; passes 2-4 within a few percent):
 Almost every layer waited on the helper: with all experts on a GPU, the CPU pool has nothing to compute, so the
 helper's round trip is the layer's whole expert time beyond the RTX's. `0 exchanged with the VRAM tier`: the
 adaptive tier has no candidates, because every expert the RTX lacks is on the helper, and those are never promoted.
+
+## A first look at IQ3_XXS with the helper (exclusive)
+
+One pass of the prompt set, not Phase 6's measurement. 0b's config (IQ3_XXS, `--resident-experts`) with the p4 engine
+and `--external-experts ... --external-experts-ram exclusive`:
+
+```
+[helper pid 141186] loaded 9438 of 19235 offered experts (15.36 GiB of device slots), reading the mapping directly
+strata generate: external helper (HIP device 0): 9438 experts, 15.36 GiB, loaded in 39.8 s; with CUDA0's 5341 that is 14779 of 24576 on the GPUs; RAM copy exclusive (leaves them out)
+FileExpertSource: mapped pinned cache complement ready: resident 15.96 GiB, pinned 15.96 GiB in 57 s; ...
+strata generate: resident RAM mode: 15.96 GiB of experts in RAM (page-locked), 5341 in the GPU cache; adaptive swaps exchange them with the GPU cache (no file reads)
+```
+
+There was no "does not fit" warning: every expert is on the RTX, on the RX, or in RAM. Prompt / decode tok/s:
+
+| Prompt | 0b (no helper) | 0c (no helper, mmap 20 GiB) | E (helper, exclusive) |
+|---|---|---|---|
+| p1-code-4k | 185.4 / 24.2 | 210.4 / 27.3 | 171.6 / 70.1 |
+| p2-code-32k | 318.7 / 30.2 | 375.7 / 27.8 | 364.3 / 66.7 |
+| p3-chat-short | 16.8 / 30.8 | 24.4 / 34.0 | 10.0 / 71.5 |
+| p4-chat-short | 36.9 / 19.4 | 43.2 / 17.4 | 12.1 / 68.5 (512) |
+| p5-tool-use | 25.2 / 20.7 | 59.4 / 10.8 | 45.0 / 64.1 |
+
+Blob reads from the file over the five prompts: 4,161 (0b 47,170; 0c 62,151). The prompt path still reads the
+helper's experts from the files in exclusive mode (plan section 4, "Prompt processing"), which is where the slower
+short prompts come from. Whether decode reads none after warm-up is for Phase 6 (`STRATA_IO_STATS=1`). Helper round
+trip p50 179-247 us, p99 417-629 us. 77-93% of layers waited on the helper (p5 65%), and there were 0 timeouts.
+`free -g` with everything loaded: 20 GB used, 10 GB available.
