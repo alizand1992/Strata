@@ -154,6 +154,8 @@ int main(int argc, char** argv) {
     xh::Request* req = xh::request_at(base, hdr->request_off);
     xh::Response* res = xh::response_at(base, hdr->response_off);
     std::vector<double> us;
+    std::vector<std::vector<double>> us_by_tok(xh::kMaxTok + 1);   // one-token requests are decode, eight are a window
+    std::vector<int> rows_by_tok(xh::kMaxTok + 1, 0);
     uint32_t seq = 0, bad = 0;
     for (int r = 0; r < o.requests; ++r) {
         const uint32_t l = r % o.layers;
@@ -182,6 +184,8 @@ int main(int argc, char** argv) {
             break;
         }
         us.push_back((double) (xh::monotonic_ns() - t0) / 1000.0);
+        us_by_tok[(size_t) n_tok].push_back(us.back());
+        rows_by_tok[(size_t) n_tok] = picked;
         if (res->status != xh::kStatusOk || res->n_rows != picked) {
             std::fprintf(stderr, "drive: request %d answered status %d n_rows %d (asked %d)%s%s\n", r, res->status,
                          res->n_rows, picked, hdr->error[0] ? ": " : "", hdr->error);
@@ -193,6 +197,11 @@ int main(int argc, char** argv) {
     if (!us.empty())
         std::printf("drive: %zu requests answered, round trip p50 %.1f us  p99 %.1f us  p99.9 %.1f us\n", us.size(),
                     pct(us, 0.50), pct(us, 0.99), pct(us, 0.999));
+    for (int t = 1; t <= xh::kMaxTok; ++t)
+        if (!us_by_tok[(size_t) t].empty())
+            std::printf("drive:   %d token%s, %2d rows: %4zu requests, p50 %.1f us  p99 %.1f us\n", t, t == 1 ? " " : "s",
+                        rows_by_tok[(size_t) t], us_by_tok[(size_t) t].size(), pct(us_by_tok[(size_t) t], 0.50),
+                        pct(us_by_tok[(size_t) t], 0.99));
 
     hdr->engine_state.store((uint32_t) xh::EngineState::Shutdown, std::memory_order_release);
     // The helper notices Shutdown on its own 250 ms poll; give it a second before insisting.

@@ -10,9 +10,8 @@
 // activation on the CPU with the kernels the pool uses - native_quant_act, native_gu_rows, native_quant_h,
 // native_down_rows on the same blob bytes FileExpertSource hands to the helper - and compares.
 //
-// The bar is the plan's: relative L1 difference (rel() of src/kernels/native_expert_parity.cpp) under 5e-3 per row.
-// That file records differences of a few 1e-3 between the CPU and GPU paths from activation rounding alone, so 5e-3 is
-// "the same answer, with the rounding the two paths do differently" and not a bit-for-bit claim.
+// The measure is the relative L1 difference (rel() of src/kernels/native_expert_parity.cpp) per row, under kBar
+// below: "the same answer, with the rounding the two paths do differently", not a bit-for-bit claim.
 #include "helper_tier.hpp"
 
 #include "strata/core/expert_source.hpp"
@@ -40,6 +39,12 @@ namespace cpu = strata::kernels::cpu;
 namespace {
 
 constexpr int64_t H = cpu::H, FF = cpu::FF;
+
+// The bar is native_expert_parity's: each path within 3e-2 of the float expert.  The plan said 5e-3 from that file's
+// "a few 1e-3", which does not hold for the low-bit packs: on the IQ3_XXS model (RX 9060 XT, 2026-10-11)
+// native_expert_parity itself measures CPU vs GPU 1.45e-2 .. 1.70e-2 on layers 0, 1, 24, 47, and this test measured
+// the helper's rows 1.3e-2 .. 2.0e-2 from the CPU's, the same with STRATA_XHELPER_STAGED=1 (worst 0.01971 both ways).
+constexpr double kBar = 3e-2;
 
 double rel(const std::vector<float>& a, const std::vector<float>& b) {
     double n = 0, d = 0;
@@ -88,6 +93,10 @@ int main() {
     const int device = env_int("STRATA_TEST_HIP_DEVICE", 0);
 
     std::string err;
+    if (!cpu::expert_layout_load(pack, n_layers, n_expert, err)) {
+        std::fprintf(stderr, "helper_tier_parity: loading the expert layout of '%s' failed: %s\n", pack, err.c_str());
+        return 1;
+    }
     strata::core::FileExpertSource source;
     source.set_gguf(env_str("STRATA_TEST_NATIVE", ""));
     if (!source.open(pack, n_layers, n_expert, err)) {
@@ -197,14 +206,14 @@ int main() {
             const double d = rel(got, wanted[(size_t) r]);
             ++checks;
             if (d > worst) worst = d;
-            if (!(d < 5e-3)) {
-                std::fprintf(stderr, "helper_tier_parity: layer %d expert %d entry %d: rel L1 %.4g (bar 5e-3)\n", layer, e,
-                             which, d);
+            if (!(d < kBar)) {
+                std::fprintf(stderr, "helper_tier_parity: layer %d expert %d entry %d: rel L1 %.4g (bar %.0e)\n", layer, e,
+                             which, d, kBar);
                 ++failures;
             }
         }
     }
-    std::printf("helper_tier_parity: %d rows checked, worst relative L1 difference %.4g (bar 5e-3)\n", checks, worst);
+    std::printf("helper_tier_parity: %d rows checked, worst relative L1 difference %.4g (bar %.0e)\n", checks, worst, kBar);
     std::printf("%s\n", (failures || checks < 8) ? "FAIL" : "PASS");
     tier.close();
     source.close();
