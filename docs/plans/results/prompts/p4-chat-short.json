@@ -1,0 +1,12 @@
+{
+ "model": "strata",
+ "messages": [
+  {
+   "role": "user",
+   "content": "Write a Python function that returns the n-th Fibonacci number in O(log n) time, with a short explanation."
+  }
+ ],
+ "temperature": 0,
+ "max_tokens": 512,
+ "stream": false
+}

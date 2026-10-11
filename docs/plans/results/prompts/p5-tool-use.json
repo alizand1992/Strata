@@ -1,0 +1,63 @@
+{
+ "model": "strata",
+ "messages": [
+  {
+   "role": "system",
+   "content": "You are a coding assistant. Use the tools when they help."
+  },
+  {
+   "role": "user",
+   "content": "Find where the function make_cache_complement_plan is defined in the repository and show me its first 40 lines."
+  }
+ ],
+ "temperature": 0,
+ "max_tokens": 256,
+ "stream": false,
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "grep",
+    "description": "Search files for a regex.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "pattern": {
+       "type": "string"
+      },
+      "path": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "pattern"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "read_file",
+    "description": "Read lines of a file.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      },
+      "offset": {
+       "type": "integer"
+      },
+      "limit": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "path"
+     ]
+    }
+   }
+  }
+ ]
+}
