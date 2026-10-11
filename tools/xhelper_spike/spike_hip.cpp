@@ -68,6 +68,8 @@ __global__ void hip_check_pattern(const uint32_t* p, uint64_t n, unsigned long l
     atomicAdd(bad, b);
 }
 
+__global__ void hip_publish_sum(const unsigned long long* sum, unsigned long long* host_sum) { *host_sum = *sum; }
+
 __global__ void hip_work_on(const uint32_t* in, uint64_t nin, uint32_t* out, uint64_t nout,
                             unsigned long long* sum) {
     unsigned long long s = 0;
@@ -184,6 +186,11 @@ int main(int argc, char** argv) {
     HIP_CHECK(hipMalloc(&dev_sum, 2 * sizeof(unsigned long long)));   // [0] the checksum, [1] the mismatch count
     dev_bad = dev_sum + 1;
     hipStream_t stream{};
+    // Test 5's stage timing, only with SPIKE_STAGES=1: the events cost the round ~35 us on the RX 9060 XT
+    const bool stages = std::getenv("SPIKE_STAGES") && std::getenv("SPIKE_STAGES")[0] == '1';
+    hipEvent_t ev[4]{};
+    if (stages)
+        for (auto& e : ev) HIP_CHECK(hipEventCreate(&e));
     HIP_CHECK(hipStreamCreate(&stream));
 
     // A private pinned buffer, the comparison the bandwidth test is against.
@@ -308,15 +315,43 @@ int main(int argc, char** argv) {
             case SPIKE_WORK: {
                 if (!registered) break;
                 const uint64_t nin = ctl->in_bytes / 4, nout = ctl->out_bytes / 4;
+                const uint64_t t_start = spike_now_ns();
+                if (stages) HIP_CHECK(hipEventRecord(ev[0], stream));
                 HIP_CHECK(hipMemsetAsync(dev_sum, 0, 2 * sizeof(unsigned long long), stream));
                 HIP_CHECK(hipMemcpyAsync(dev_in, in_region, ctl->in_bytes, hipMemcpyHostToDevice, stream));
+                if (stages) HIP_CHECK(hipEventRecord(ev[1], stream));
                 hip_work_on<<<(unsigned) grid_for(nout), 256, 0, stream>>>(dev_in, nin, dev_out, nout, dev_sum);
+                if (stages) HIP_CHECK(hipEventRecord(ev[2], stream));
                 HIP_CHECK(hipMemcpyAsync(out_region, dev_out, ctl->out_bytes, hipMemcpyDeviceToHost, stream));
+                if (stages) HIP_CHECK(hipEventRecord(ev[3], stream));
                 HIP_CHECK(hipStreamSynchronize(stream));
+                const uint64_t t_synced = spike_now_ns();
                 unsigned long long out[2] = {0, 0};
                 HIP_CHECK(hipMemcpy(&out, dev_sum, 2 * sizeof(unsigned long long), hipMemcpyDeviceToHost));
+                const uint64_t t_end = spike_now_ns();
                 ctl->child_work_sum = out[0];
+                for (int k = 0; stages && k < 3; ++k) {
+                    float ms = 0.f;
+                    HIP_CHECK(hipEventElapsedTime(&ms, ev[k], ev[k + 1]));
+                    rep->work_stage_ns[k] += (uint64_t) (ms * 1e6f);
+                }
+                rep->work_stage_ns[3] += t_end - t_synced;
+                rep->work_stage_ns[4] += t_end - t_start;
                 rep->work_rounds++;
+                break;
+            }
+            case SPIKE_WORK_ZERO: {
+                if (!registered || !dev_alias) break;
+                const uint64_t nin = ctl->in_bytes / 4, nout = ctl->out_bytes / 4;
+                char* alias = reinterpret_cast<char*> (dev_alias);
+                const uint32_t* in_dev = reinterpret_cast<const uint32_t*> (alias + (in_region - (char*) base));
+                uint32_t* out_dev = reinterpret_cast<uint32_t*> (alias + (out_region - (char*) base));
+                auto* sum_dev = reinterpret_cast<unsigned long long*> (
+                    alias + (reinterpret_cast<char*> (&ctl->child_work_sum) - (char*) base));
+                HIP_CHECK(hipMemsetAsync(dev_sum, 0, 2 * sizeof(unsigned long long), stream));
+                hip_work_on<<<(unsigned) grid_for(nout), 256, 0, stream>>>(in_dev, nin, out_dev, nout, dev_sum);
+                hip_publish_sum<<<1, 1, 0, stream>>>(dev_sum, sum_dev);
+                HIP_CHECK(hipStreamSynchronize(stream));
                 break;
             }
             case SPIKE_QUIT:

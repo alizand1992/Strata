@@ -62,7 +62,9 @@ enum Cmd : uint32_t {
     SPIKE_PING = 5,        // answer a ping; ctl::variant says how the child waits
     SPIKE_WORK = 6,        // test 5: 80 KiB in, a kernel, 200 KiB back
     SPIKE_STATS = 7,
-    SPIKE_QUIT = 8
+    SPIKE_QUIT = 8,
+    SPIKE_WORK_ZERO = 9    // test 5 without DMA: the kernel reads the 80 KiB and writes the 200 KiB through the
+                           // mapped device pointer, and publishes its checksum into the mapping (no read-back)
 };
 
 enum State : uint32_t { SPIKE_STARTING = 0, SPIKE_READY = 1, SPIKE_FAILED = 2, SPIKE_EXITED = 3 };
@@ -134,6 +136,10 @@ struct alignas(64) Report {
     uint64_t work_rounds;
     uint64_t work_p50_us;
     uint64_t work_p99_us;
+    // Where a work round's time goes, summed over work_rounds (ns): [0] memset + 80 KiB H2D, [1] the kernel,
+    // [2] 200 KiB D2H (all three from HIP events on the stream), [3] the checksum read-back (a synchronous hipMemcpy),
+    // [4] the whole round on the child's clock, from the doorbell seen to the answer.
+    uint64_t work_stage_ns[5];
     char device_name[64];
 };
 static_assert(sizeof(Report) <= kReportBytes, "the report block must fit its region");
