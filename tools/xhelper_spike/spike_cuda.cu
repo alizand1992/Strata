@@ -216,7 +216,7 @@ int main(int argc, char** argv) {
     for (uint32_t waited = 0; waited < 120000; waited += 100) {
         if (ctl->state.load() == SPIKE_READY) { kid_ready = true; break; }
         if (ctl->state.load() == SPIKE_FAILED) break;
-        usleep(100);
+        usleep(100 * 1000);   // 100 ms a step: 120 s in all (usleep takes microseconds)
     }
     if (!kid_ready) {
         std::printf("\nTEST 1  dual registration : the HIP half never got ready\n");
@@ -380,12 +380,14 @@ int main(int argc, char** argv) {
 
     // ---- TEST 4  round-trip latency
     std::printf("\nTEST 4  round-trip latency on the two doorbell words (%u pings per variant)\n", rounds);
-    Sample ping[3];
+    // Nanoseconds, not microseconds: a spinning ping on one machine is well under 1 us, which whole microseconds
+    // round to 0.
+    uint64_t ping_p50_ns[3] = {0, 0, 0};
     for (uint32_t v = 0; v < 3; ++v) {
         ctl->variant.store(v);
         const bool parent_futex = v == SPIKE_BOTH_FUTEX;
-        std::vector<uint64_t> us;
-        us.reserve(rounds);
+        std::vector<uint64_t> ns;
+        ns.reserve(rounds);
         uint32_t timeouts = 0;
         for (uint32_t r = 0; r < rounds; ++r) {
             const uint64_t t0 = spike_now_ns();
@@ -397,13 +399,14 @@ int main(int argc, char** argv) {
             const uint32_t got =
                 spike_wait(ctl->done, spin_us, parent_futex, deadline, [&](uint32_t x) { return x == seq; });
             if (got != seq) { ++timeouts; continue; }
-            us.push_back((spike_now_ns() - t0) / 1000);
+            ns.push_back(spike_now_ns() - t0);
         }
-        std::sort(us.begin(), us.end());
-        summarize(us, 0, ping[v]);
+        std::sort(ns.begin(), ns.end());
+        ping_p50_ns[v] = pct(ns, 0.5);
         const char* names[3] = {"both spin         ", "child futex, spin ", "both futex        "};
-        std::printf("  %s p50 %8.1f us  p99 %8.1f us  p999 %8.1f us  timeouts %u\n", names[v], (double) ping[v].p50_us,
-                    (double) ping[v].p99_us, (double) pct(us, 0.999), timeouts);
+        std::printf("  %s p50 %8.2f us  p99 %8.2f us  p999 %8.2f us  timeouts %u\n", names[v],
+                    (double) pct(ns, 0.5) / 1000.0, (double) pct(ns, 0.99) / 1000.0, (double) pct(ns, 0.999) / 1000.0,
+                    timeouts);
     }
     std::printf("  the child's own view: %llu answered pings, mean wait %llu us (spin) / %llu us (child futex) /"
                 " %llu us (both futex)\n",
@@ -412,13 +415,13 @@ int main(int argc, char** argv) {
                 rep->ping_rounds ? (unsigned long long) (rep->ping_wait_sum_us[1] / rep->ping_rounds) : 0ull,
                 rep->ping_rounds ? (unsigned long long) (rep->ping_wait_sum_us[2] / rep->ping_rounds) : 0ull);
     std::printf("  target                : p50 < 150 us on the spin variant (Gate 1)\n");
-    std::printf("  verdict               : %s\n", ping[0].p50_us > 0 && ping[0].p50_us < 150 ? "PASS" : "FAIL");
+    std::printf("  verdict               : %s\n", ping_p50_ns[0] > 0 && ping_p50_ns[0] < 150000 ? "PASS" : "FAIL");
 
     // ---- TEST 5  round trip with work
     std::printf("\nTEST 5  round trip with work (%u rounds: 80 KiB in, a kernel on the AMD card, 200 KiB back)\n",
                 work_rounds);
     cuda_fill_pattern<<<(unsigned) grid_for(kWorkInBytes / 4), 256, 0, stream>>>(dev_buf, kWorkInBytes / 4);
-    CUDA_CHECK(cudaMemcpyAsync(in_region, dev_buf, kWorkInBytes, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(in_region, dev_buf, kWorkInBytes, cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::vector<uint64_t> work_us;
     uint32_t work_bad = 0, work_timeouts = 0;
@@ -436,6 +439,34 @@ int main(int argc, char** argv) {
     summarize(work_us, kWorkInBytes + kWorkOutBytes, work);
     print_sample("full round trip", work);
     std::printf("  wrong results %u, timeouts %u\n", work_bad, work_timeouts);
+
+    // The same work with no DMA (SPIKE_WORK_ZERO): the AMD kernel reads and writes the mapping over PCIe directly.
+    // Not the plan's design; measured to see whether this link can meet the target at all.
+    std::vector<uint64_t> zero_us;
+    uint32_t zero_bad = 0, zero_timeouts = 0;
+    for (uint32_t r = 0; r < work_rounds; ++r) {
+        std::memset(out_region, 0, kWorkOutBytes);
+        ctl->child_work_sum = 0;
+        const uint64_t t0 = spike_now_ns();
+        const int rc = send_command(ctl, SPIKE_WORK_ZERO, spin_us, false, 5000);
+        if (rc != 0) { ++zero_timeouts; continue; }
+        zero_us.push_back((spike_now_ns() - t0) / 1000);
+        const uint32_t* out = (const uint32_t*) out_region;
+        uint64_t sum_out = 0;
+        for (uint64_t i = 0; i < kWorkOutBytes / 4; ++i) sum_out += out[i];
+        if (sum_out != ctl->child_work_sum || sum_out == 0) ++zero_bad;
+    }
+    Sample zero;
+    summarize(zero_us, kWorkInBytes + kWorkOutBytes, zero);
+    print_sample("zero-copy round trip", zero);
+    std::printf("  wrong results %u, timeouts %u (zero-copy)\n", zero_bad, zero_timeouts);
+    if (rep->work_rounds && rep->work_stage_ns[0]) {   // the child timed the stages (SPIKE_STAGES=1)
+        const double n = (double) rep->work_rounds * 1000.0;
+        std::printf("  child's stages (mean us): memset + H2D %.1f, kernel %.1f, D2H %.1f, checksum read-back %.1f;"
+                    " whole round on the child %.1f\n",
+                    rep->work_stage_ns[0] / n, rep->work_stage_ns[1] / n, rep->work_stage_ns[2] / n,
+                    rep->work_stage_ns[3] / n, rep->work_stage_ns[4] / n);
+    }
     std::printf("  target                : p50 < 150 us, p99 < 500 us (Gate 1)\n");
     std::printf("  verdict               : %s\n",
                 work.p50_us > 0 && work.p50_us < 150 && work.p99_us < 500 ? "PASS" : "FAIL");
