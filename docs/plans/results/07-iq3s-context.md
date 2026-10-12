@@ -40,3 +40,45 @@ computed its experts on the CPU from the files, which is p3-p5's 2-10 tok/s.
 - **Short prompts are slow at every size (4-15 tok/s).** In exclusive mode the prompt path reads the helper's
   15.4 GiB of experts from the files, and with RAM full the file cache cannot keep them.
 - **One slow answer is enough to lose the helper.** The 2 s timeout treats a swap stall like a dead process.
+
+## A late answer no longer stops the helper
+
+Change (this branch, after the runs above): a timeout with the helper's process still there is now transient.
+`finish()` returns false, the CPU pool computes that layer's helper rows from the files (the fallback of
+[06-results.md](06-results.md)), and the helper stays in use. `begin()` owns nothing until the late answer arrives,
+because it may not write a new request over one the helper could still be reading. After that the helper gets requests
+again. The helper only counts as gone if its process exits, it answers with an error, or it has not answered at all
+for `STRATA_XH_GIVE_UP_MS` (default 60000). The engine prints one line when a stall starts and one when it ends:
+
+```
+strata: external experts: no answer within 300 ms (layer 0); the CPU computes the helper's rows until it answers
+strata: external experts: the helper answered again after 0.3 s
+```
+
+`xhelper_external_experts_test` has a new step: it sends SIGSTOP to the helper with a request in flight (timeout set
+to 300 ms in the test), and checks that `finish()` fails, the helper stays alive, and `begin()` owns nothing. After
+SIGCONT it checks that the helper answers again and its rows still match (rel L1 0.0146, bar 3e-2). The kill -9 step
+is unchanged. PASS. Both backends build (CUDA `strata` and the test; HIP `strata` and `strata-expert-helper`).
+
+## Reruns at 128K and 256K with the change
+
+Same configs, int8 K/V (the owner does not want K/V below 8 bits), one fresh server and one pass each:
+
+| | 128K before | 128K rerun | 256K before | 256K rerun |
+|---|---|---|---|---|
+| RAM copy | 23.66 GiB | 23.58 GiB | 23.57 GiB | 22.44 GiB |
+| Decode tok/s p1 / p2 / p3 / p4 / p5 | 52.6 / 49.6 / 50.2 / 43.4 / 35.1 | 48.5 / 55.3 / 46.4 / 50.5 / 30.7 | 33.4 / 41.8 / 10.4 / 3.0 / 2.0 | 32.8 / 41.0 / 34.3 / 29.8 / 27.0 |
+| Prompt tok/s 4K / 32K | 140.1 / 244.3 | 128.8 / 246.3 | 123.0 / 237.1 | 137.7 / 237.5 |
+| Prompt tok/s p3 / p4 / p5 | 5.1 / 4.8 / 14.8 | 4.8 / 4.5 / 14.8 | 4.2 / 3.8 / 12.6 | 5.6 / 4.4 / 15.5 |
+| Decode-pool blobs outside the RAM copy | 137-672 | 219-754 | 1,230-78,188 | 1,219-5,551 |
+| Helper round trip p99 | 3.5-17.3 ms | 2.2-17.3 ms | 4.4-14.8 ms | 4.9-13.9 ms |
+| Timeouts | 0 | 0 | 1 (helper dropped) | 0 |
+
+At 256K the helper stayed in use for all five prompts, and decode held at 27-41 tok/s instead of dropping to 2-10.
+But there was **no timeout in this rerun**, so the new code path did not run here. Only the test exercises it. The
+rerun had no 2 s stall to recover from. The first 256K attempt of the rerun did not start: the engine was still
+page-locking its RAM copy after 15 minutes (2.38 GiB really free, 0.9 GB in swap from the runs before it), and the
+script gave up. The second attempt page-locked 22.44 GiB in 61 s.
+
+The prompt numbers come from the prompt set's 4K and 32K prompts on each context size. No prompt longer than 32K
+was run, so prefill deep into a 128K or 256K context is not measured.

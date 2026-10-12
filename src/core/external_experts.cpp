@@ -49,6 +49,7 @@ bool ExternalExperts::begin(int64_t, const float*, const int32_t*, int64_t, int6
                             std::string&) { return true; }
 bool ExternalExperts::finish(float*, std::string&) { return true; }
 bool ExternalExperts::take_round_trips(double&, double&, int64_t&) { return false; }
+bool ExternalExperts::settle_stale() { return true; }
 void ExternalExperts::fail(const std::string&) {}
 
 #else
@@ -198,6 +199,7 @@ bool ExternalExperts::open(const Options& opt, const std::string& pack, const st
     owned_.assign((size_t) CAP, 0);
     alive_ = true;
     valid_ = true;
+    stale_ = false;
     seq_ = 0;
     return true;
 }
@@ -206,6 +208,7 @@ void ExternalExperts::close() {
     alive_ = false;
     valid_ = false;
     pending_ = false;
+    stale_ = false;
     if (hdr_ != nullptr) {
         hdr_->engine_state.store((uint32_t) xh::EngineState::Shutdown, std::memory_order_release);
         xh::wake_always(&req_->seq);
@@ -251,7 +254,9 @@ bool ExternalExperts::begin(int64_t layer, const float* x, const int32_t* ids, i
         return false;
     }
     std::fill(owned_.begin(), owned_.begin() + n, 0);
-    if (!alive_ || !layers_present_[(size_t) layer]) return true;
+    if (!alive_) return true;
+    if (stale_ && !settle_stale()) return true;   // the late answer is not there yet: the CPU does this layer
+    if (!layers_present_[(size_t) layer]) return true;
     int32_t m = 0;
     for (int64_t i = 0; i < n; ++i) {
         const int32_t e = ids[i];
@@ -304,9 +309,21 @@ bool ExternalExperts::finish(float* out, std::string& err) {
     const std::string at = " (layer " + std::to_string(pending_layer_) + ")";
     if (!answered) {
         ++timeouts_;
-        const std::string why = pid_ < 0 ? "the helper process exited" : "no answer within " + std::to_string(opt_.timeout_ms) + " ms";
-        fail(why);
-        err = "external experts: " + why + at;
+        if (pid_ < 0) {
+            fail("the helper process exited");
+            err = "external experts: the helper process exited" + at;
+            return false;
+        }
+        // Alive but late (a swap stall, a busy card): the CPU computes this layer's rows, and the helper is asked again
+        // once it has answered this request (begin() never writes over a request the helper may still be reading).
+        if (!stale_) {
+            stale_ = true;
+            stale_since_ns_ = seen_ns - (uint64_t) opt_.timeout_ms * 1000000ull;
+            ++stalls_;
+            std::fprintf(stderr, "strata: external experts: no answer within %d ms (layer %lld); the CPU computes the "
+                                 "helper's rows until it answers\n", opt_.timeout_ms, (long long) pending_layer_);
+        }
+        err = "external experts: no answer within " + std::to_string(opt_.timeout_ms) + " ms" + at;
         return false;
     }
     if (res_->status != xh::kStatusOk || res_->n_rows != pending_entries_) {
@@ -325,6 +342,23 @@ bool ExternalExperts::finish(float* out, std::string& err) {
     for (int32_t r = 0; r < res_->n_rows; ++r)
         std::memcpy(out + (size_t) res_->entry[r] * H, res_->rows + (size_t) r * H, (size_t) H * sizeof(float));
     return true;
+}
+
+bool ExternalExperts::settle_stale() {
+    if (res_->seq.load(std::memory_order_acquire) == seq_) {
+        stale_ = false;
+        std::fprintf(stderr, "strata: external experts: the helper answered again after %.1f s\n",
+                     (double) (xh::monotonic_ns() - stale_since_ns_) / 1e9);
+        return true;
+    }
+    int status = 0;
+    if (pid_ > 0 && waitpid(pid_, &status, WNOHANG) == pid_) {
+        pid_ = -1;
+        fail("the helper process exited");
+    } else if (xh::monotonic_ns() - stale_since_ns_ >= (uint64_t) opt_.give_up_ms * 1000000ull) {
+        fail("no answer for " + std::to_string(opt_.give_up_ms / 1000) + " s");
+    }
+    return false;
 }
 
 bool ExternalExperts::take_round_trips(double& p50_us, double& p99_us, int64_t& count) {

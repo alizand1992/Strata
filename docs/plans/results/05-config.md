@@ -62,8 +62,9 @@ engine's environment, and it needs `libamdhip64` and friends on `LD_LIBRARY_PATH
 - `--external-experts-ram inclusive` keeps the helper's experts in the RAM copy too. Prompts are then as fast as
   without the helper, but the model needs the RAM it needed before.
 - `STRATA_XH_TRACE=1` adds the helper's round-trip percentiles to the per-request `external:` line and passes
-  `--verbose` to the helper. `STRATA_XH_TIMEOUT_MS` (default 2000) is how long one layer waits before the helper
-  counts as gone.
+  `--verbose` to the helper. `STRATA_XH_TIMEOUT_MS` (default 2000) is how long one layer waits for the helper. After
+  that the CPU computes the layer, and the helper is used again once it has answered. `STRATA_XH_GIVE_UP_MS` (default
+  60000) is how long it may go without answering before it counts as gone.
 
 ## What it prints
 
