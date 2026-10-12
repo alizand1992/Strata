@@ -6718,6 +6718,7 @@ int main(int argc, char** argv) {
         auto env_u = [](const char* name, long fallback) { const char* v = std::getenv(name); return v && v[0] ? std::atol(v) : fallback; };
         xo.spin_us = (uint32_t) env_u("STRATA_XH_SPIN_US", 200);
         xo.timeout_ms = (int) env_u("STRATA_XH_TIMEOUT_MS", 2000);
+        xo.give_up_ms = (int) env_u("STRATA_XH_GIVE_UP_MS", 60000);
         xo.trace = env_u("STRATA_XH_TRACE", 0) != 0;
         if (!external.open(xo, o.pack, o.native_preset, g.n_layers, g.n_expert, ranked, xcache, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());

@@ -8,7 +8,10 @@
 //      the entries whose expert the helper holds, finish() must write exactly those rows, and each one must match the
 //      CPU pool's own kernels on the same blob and activation (the helper parity test's bar, 3e-2: the engine's own
 //      CPU/GPU gap on the low-bit packs, see tests/xhelper/helper_tier_parity.cpp).
-//   3. kill -9 the helper in the middle of a request: finish() fails once, alive() is false, and the next begin()
+//   3. SIGSTOP the helper with a request in flight (a stall, as in a swap storm): finish() fails, alive() stays true,
+//      and begin() owns nothing while the late answer is missing.  After SIGCONT the helper answers it, and begin()
+//      owns rows again, which must still match.
+//   4. kill -9 the helper in the middle of a request: finish() fails once, alive() is false, and the next begin()
 //      owns nothing.
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
@@ -17,6 +20,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <csignal>
 #include <cmath>
 #include <cstdio>
@@ -24,6 +28,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace cpu = strata::kernels::cpu;
@@ -94,6 +99,7 @@ int main() {
     strata::core::ExternalExperts::Options opt;
     opt.helper_exe = helper;
     if (const char* d = env_str("STRATA_TEST_HIP_DEVICE")) opt.hip_device = std::atoi(d);
+    opt.timeout_ms = 300;   // the stall below
     const strata::core::ExpertCache no_primary;   // an unopened cache holds nothing
     if (!ext.open(opt, pack, native, n_layers, n_expert, ranked, no_primary, err)) {
         std::fprintf(stderr, "external_experts_test: %s\n", err.c_str());
@@ -151,6 +157,39 @@ int main() {
     std::printf("external_experts_test: 200 requests, %lld helper rows checked (worst rel L1 %.4g, bar %.0e), %lld rows "
                 "left to the CPU untouched; begin %.1f ms, wait %.1f ms\n", (long long) rows, worst, kBar,
                 (long long) unowned, ext.ms_begin(), ext.ms_wait());
+
+    // The helper stalls with a request in flight, then comes back.
+    for (int64_t i = 0; i < K; ++i) ids[(size_t) i] = (int32_t) i;
+    if (!ext.begin(layers[0], x.data(), ids.data(), 1, K, nullptr, nullptr, err)) { std::fprintf(stderr, "begin: %s\n", err.c_str()); return 1; }
+    kill(ext.pid(), SIGSTOP);
+    const bool stalled_finish = ext.finish(out.data(), err);
+    std::printf("external_experts_test: stalled: finish %s (%s), alive %d\n", stalled_finish ? "succeeded" : "failed",
+                err.c_str(), (int) ext.alive());
+    if (!stalled_finish) {
+        if (!ext.alive() || !ext.stalled()) { std::fprintf(stderr, "external_experts_test: a stall stopped the helper\n"); ++failures; }
+        if (!ext.begin(layers[0], x.data(), ids.data(), 1, K, nullptr, nullptr, err)) ++failures;
+        for (int64_t i = 0; i < K; ++i) if (ext.owns(i)) { std::fprintf(stderr, "external_experts_test: owned rows during a stall\n"); ++failures; break; }
+        if (!ext.finish(out.data(), err)) ++failures;   // nothing pending: true
+    }
+    kill(ext.pid(), SIGCONT);
+    bool back = false;
+    for (int tries = 0; tries < 100 && !back; ++tries) {
+        std::fill(out.begin(), out.end(), nan);
+        if (!ext.begin(layers[0], x.data(), ids.data(), 1, K, nullptr, nullptr, err)) { ++failures; break; }
+        back = ext.owns(0);
+        if (!ext.finish(out.data(), err)) { ++failures; break; }
+        if (!back) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (back) {
+        cpu_row(lay.fmt[(size_t) layers[0]], source.blob(layers[0], ids[0]), x.data(), want);
+        const double d = rel(out.data(), want);
+        std::printf("external_experts_test: after SIGCONT: the helper answers again (rel L1 %.4g), stalls %lld, alive %d\n",
+                    d, (long long) ext.stalls(), (int) ext.alive());
+        if (!(d < kBar)) ++failures;
+    } else {
+        std::fprintf(stderr, "external_experts_test: the helper was not used again after SIGCONT\n");
+        ++failures;
+    }
 
     // The helper dies with a request in flight.
     for (int64_t i = 0; i < K; ++i) ids[(size_t) i] = (int32_t) i;
