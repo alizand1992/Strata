@@ -279,7 +279,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   spark("sp-speed", h.tok_s);
   spark("sp-prefill", h.prefill_tok_s_mean);
   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
-  const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
+  const per = (f) => (hw.gpus || []).map((g) => `${g.helper ? "Helper" : `GPU ${g.index}`} ${f(g)}`).join(" · ");
   const multi = (hw.gpus || []).length > 1;
   setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
             multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || (st.gpu_note ? "not available" : ""));

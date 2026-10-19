@@ -5008,6 +5008,54 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertFalse(telemetry.gpu_reader(0, amd=True).ok())
                 self.assertIsNone(telemetry.free_vram_mib(0, amd=True))
 
+    def test_external_helper_card_beside_nvidia(self):
+        """Option A: a CUDA engine's --external-experts helper runs on an AMD card; the Monitor reads it from sysfs
+        beside the NVIDIA card, under its own name ("hip1", not a second "0"), and a config without a helper keeps
+        the readings as they were."""
+        from serve import telemetry
+        from serve.server import external_helper_devices
+
+        class FakeNvml:
+            def __init__(self, index=0):
+                self.index = index
+
+            def ok(self):
+                return True
+
+            def name(self):
+                return "NVIDIA GeForce RTX 5060 Ti"
+
+            def read(self):
+                return {"util": 50, "mem_used": 10 << 30, "mem_total": 16 << 30, "temp": 60.0, "power": 100.0}
+
+        helper = ["--native", "x.gguf", "--external-experts", "build-hip/strata-expert-helper"]
+        self.assertEqual(external_helper_devices({"args": helper}), [0])
+        self.assertEqual(external_helper_devices({"args": helper + ["--external-experts-device", "1"]}), [1])
+        self.assertEqual(external_helper_devices({"args": ["--native", "x.gguf"]}), [])
+        self.assertEqual(external_helper_devices({"args": helper, "backend": "hip"}), [])
+        self.assertEqual(external_helper_devices({}), [])
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            with mock.patch.object(telemetry, "SYSFS", d), mock.patch.object(telemetry, "_Nvml", FakeNvml), \
+                    mock.patch.object(telemetry.sys, "platform", "linux"):
+                t = telemetry.Telemetry(gpu_index=0, helper_amd=[1])
+                s = t.sample()
+                self.assertEqual(t.static["gpu_name"], "NVIDIA GeForce RTX 5060 Ti + AMD Radeon AI PRO R9700")
+                self.assertEqual(t.static["gpu_count"], 2)
+                self.assertEqual([(g["index"], g["helper"], g["util"]) for g in s["gpus"]],
+                                 [(0, False, 50), ("hip1", True, 99)])
+                self.assertEqual([g["name"] for g in s["gpus"]], ["NVIDIA GeForce RTX 5060 Ti", "AMD Radeon AI PRO R9700"])
+                self.assertIn("pcie_width", s["gpus"][1])                     # each card's own link, for its row
+                self.assertEqual(s["gpu_mem_used"], (10 << 30) + (6 << 30))
+                t.close()
+                plain = telemetry.Telemetry(gpu_index=0)                        # no helper: one card, as before
+                s = plain.sample()
+                self.assertEqual((plain.static["gpu_count"], "gpus" in s), (1, False))
+                plain.close()
+                gone = telemetry.Telemetry(gpu_index=0, helper_amd=[5])         # no such AMD card: left out
+                self.assertEqual(gone.static["gpu_count"], 1)
+                gone.close()
+
     def test_free_vram_on_hip(self):
         from serve import telemetry
         tok = ByteTokenizer()

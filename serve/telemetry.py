@@ -529,12 +529,13 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
+    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, helper_amd=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
         PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the AMD backend's
-        cards, numbered as HIP numbers them, read from sysfs (#301)."""
+        cards, numbered as HIP numbers them, read from sysfs (#301).  `helper_amd`: the AMD cards an --external-experts
+        helper runs on beside a CUDA engine (HIP's numbering, sysfs); they count as more cards, named "hip<N>"."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
@@ -542,7 +543,11 @@ class Telemetry:
         idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
         self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
+        # Option A: the helper's AMD card is not the engine's, so it has its own name ("hip0" beside NVIDIA's 0)
+        self.helpers = [(f"hip{h}", r) for h in (helper_amd or []) if not amd for r in [_Amd(h)] if r.ok()]
+        self.gpus += self.helpers
         self.gpu = self.gpus[0][1]
+        self.names = {i: g.name() for i, g in self.gpus} if self.helpers else {}   # the Monitor's per-card rows
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
@@ -617,6 +622,12 @@ class Telemetry:
                 s["gpus"] = [{"index": i, "name": reader.name(), "util": r.get("util"), "mem_used": r.get("mem_used"),
                               "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power")}
                              for (i, r), (_, reader) in zip(reads, self.gpus)]
+                if self.helpers:
+                    names = {n for n, _ in self.helpers}
+                    for e, (_, r) in zip(s["gpus"], reads):     # each card's own name, power cap and PCIe link
+                        e["helper"] = e["index"] in names
+                        e.update({k: r.get(k) for k in ("power_limit", "pcie_gen", "pcie_gen_max", "pcie_width",
+                                                        "pcie_rx_mb", "pcie_tx_mb")})
             s.update({f"gpu_{k}": v for k, v in g.items()})
         if self.ps:
             try:
