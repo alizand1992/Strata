@@ -449,7 +449,8 @@ all of them; the helper loads what fits its budget, in order.
      timings to stderr).
    Add all four to the usage text (the `--expert-cache-remote-placement` lines, ~824, show the format).
 2. **Validation** (next to the check at ~2046), refuse with one clear line each: with `--expert-cache-device1..3`,
-   `--peer-device`, a layer split (`multi_gpu`), `--batch`, `--pipeline-windows 2`, `--vram-elastic`, `--kv-grow`,
+   `--peer-device`, a layer split (`multi_gpu`), `--batch`, `--pipeline-windows 2`, `--vram-elastic`, `--kv-grow` (allowed
+   since branch xhelper/kv-grow, see results/09-kv-grow.md),
    `--remote-expert-opt`; without `--expert-profile`; without the expert pool; in a HIP build; on non-Linux.
 3. **Open** the helper right after the remote-experts block (after line ~4914, before `Drive drive;`), so `xcache`
    is filled and the helper's pairs exist before the RAM copy is built. Print:

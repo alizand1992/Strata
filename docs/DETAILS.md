@@ -366,8 +366,11 @@ move on a Threadripper PRO 3975WX + R9700 (14.5 ms, +0.4%, 5 pairs); no case rea
 **Switches added in 0.1.40 (all off unless noted; none changes the default output):**
 - `--kv-grow` (or `STRATA_KV_GROW=1`; `--no-kv-grow` turns it off): the K/V takes VRAM only for the cells the requests
   reach, and the expert cache holds the rest, giving slots back as the context grows. It needs one GPU, an expert
-  profile, the whole K/V in VRAM (no KV streaming) and every expert in RAM (not the resident low-RAM mode); otherwise,
-  and with `--batch`, `--vram-elastic` or `--peer-device`, the engine says so and stays off.
+  profile and the whole K/V in VRAM (no KV streaming); otherwise, and with `--batch`, `--vram-elastic` or
+  `--peer-device`, the engine says so and stays off. In the resident low-RAM mode (the RAM copy holds only what the GPU
+  does not) an expert the cache gives up takes the RAM place of a colder one of its layer, and one refilled into the
+  cache gives its RAM place back; it works beside `--external-experts` (the helper's experts are never refilled into
+  the cache).
   On HIP (ROCm 6+) it runs through hipMemAddressReserve / hipMemCreate / hipMemMap (2 MiB chunks; the card must report
   virtual memory management, `STRATA_HIP_VMM=0` turns it off); until then every AMD card printed "--kv-grow is off".
   Radeon AI PRO R9700 with `--vram-reserve-mib 17084` (a 16 GB card), Q2_0 pack, `--max-context 196608`, 5 interleaved pairs:

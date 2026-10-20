@@ -624,7 +624,7 @@ class Telemetry:
                              for (i, r), (_, reader) in zip(reads, self.gpus)]
                 if self.helpers:
                     names = {n for n, _ in self.helpers}
-                    for e, (_, r) in zip(s["gpus"], reads):     # each card's own name, power cap and PCIe link
+                    for e, (_, r) in zip(s["gpus"], reads):     # each card's power cap and PCIe link
                         e["helper"] = e["index"] in names
                         e.update({k: r.get(k) for k in ("power_limit", "pcie_gen", "pcie_gen_max", "pcie_width",
                                                         "pcie_rx_mb", "pcie_tx_mb")})

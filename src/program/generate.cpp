@@ -3355,7 +3355,6 @@ int main(int argc, char** argv) {
                         : o.batch != 0 ? "not with --batch"
                         : o.pipeline_windows >= 2 ? "not with --pipeline-windows 2"
                         : o.vram_elastic ? "not with --vram-elastic"
-                        : o.kv_grow ? "not with --kv-grow"
                         : o.expert_profile.empty() ? "it needs --expert-profile"
                         : o.no_pool ? "it needs the expert pool"
 #if defined(STRATA_USE_HIP)
@@ -5197,21 +5196,22 @@ int main(int argc, char** argv) {
     {
         const strata::core::OnDevice on0(primary_device);   // STRATA_PRIMARY_DEVICE (upstream: a literal 0)
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
-        // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming), a profiled cache
-        // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up
+        // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming) and a profiled cache
+        // that can give slots up.  The CPU computes the experts it gives up: from RAM, or in the resident RAM mode from
+        // the copy, which takes them in place of colder ones (kvg_ram_take)
         {
             const char* ev = std::getenv("STRATA_KV_GROW");
             bool remote = false;
             for (const int r : o.expert_cache_remote) remote = remote || r > 0;
             const bool asked = ev != nullptr && ev[0] != '\0' ? ev[0] != '0' : o.kv_grow;
             const bool on = asked && !multi_gpu && o.kv_resident <= 0 &&
-                            !o.expert_profile.empty() && !o.resident_cpu_experts && o.expert_cache != 0 && !remote &&
+                            !o.expert_profile.empty() && o.expert_cache != 0 && !remote &&
                             strata::core::vmm_available() &&
                             // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range
                             o.batch == 0 && !o.vram_elastic && o.peer_device < 0;
             if (asked && !on)
                 std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU, a profile, the whole K/V in VRAM, "
-                                     "every expert in RAM, no --batch, --vram-elastic or --peer-device)\n");
+                                     "no --batch, --vram-elastic or --peer-device)\n");
             const char* iv = std::getenv("STRATA_KV_GROW_INIT");
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
@@ -7856,7 +7856,67 @@ int main(int argc, char** argv) {
         int64_t cells = 0;                // what every K/V pool holds now
         std::vector<strata::core::VmmChunk> spare;   // out of the cache, not (yet) in the K/V
         int64_t grows = 0, trims = 0, fresh = 0, evicted = 0, refilled = 0;
+        int64_t ram_taken = 0, ram_freed = 0;   // the resident RAM mode: kvg_ram_take / kvg_ram_free
+        std::vector<int32_t> rank;              // residency index -> profile rank (profile.size() if unranked)
     } kvg;
+    // Heat for the elastic K/V's choices: the adaptive tier's routing counts, then the profile's rank.
+    auto kvg_heat = [&](size_t i) -> float {
+        if (kvg.rank.empty()) {
+            kvg.rank.assign(host_res.size(), (int32_t) profile.size());
+            for (size_t r = 0; r < profile.size(); ++r)
+                kvg.rank[(size_t) profile[r].first * (size_t) g.n_expert + (size_t) profile[r].second] = (int32_t) r;
+        }
+        const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[i];
+        return u * 1048576.0f - (float) kvg.rank[i];
+    };
+    // The resident RAM mode (--resident-experts) holds only what the GPUs do not, so an expert the cache gives up to
+    // the K/V has no copy but the files.  Each takes the RAM place of the coldest expert of its layer that the copy
+    // holds and no GPU does, if that one is colder (one file read each; the RAM stays the same size).  So does an
+    // expert moved into the prompt path's loan region: a lent slot is refilled from RAM after every prompt, and from
+    // the SSD when the copy does not hold it.  On a quiet device, with no adaptive round in flight (kvg_ensure's
+    // quiesce).
+    auto kvg_ram_take = [&](const std::vector<int32_t>& want) -> int64_t {
+        if (srcp != &src || !src.complement_ready()) return 0;
+        int64_t n = 0;
+        for (const int32_t i : want) {
+            const int64_t l = i / g.n_expert;
+            const int32_t e = (int32_t) (i % g.n_expert);
+            if (src.has_resident(l, e) || helper_holds(l, e)) continue;
+            int32_t out = -1;
+            float out_heat = 0.0f;
+            for (int32_t c = 0; c < (int32_t) g.n_expert; ++c) {
+                const size_t j = (size_t) l * (size_t) g.n_expert + (size_t) c;
+                if (host_res[j] >= 0 || !src.has_resident(l, c)) continue;
+                const float h = kvg_heat(j);
+                if (out < 0 || h < out_heat) { out = c; out_heat = h; }
+            }
+            if (out >= 0 && out_heat < kvg_heat((size_t) i) && src.replace_resident(l, e, out)) ++n;
+        }
+        kvg.ram_taken += n;
+        return n;
+    };
+    // The other way (kvg_trim): an expert refilled into the cache from the RAM copy is held twice, so its RAM place
+    // goes to the hottest expert of its layer that neither a GPU nor the copy holds.
+    auto kvg_ram_free = [&](const std::vector<size_t>& refilled) -> int64_t {
+        if (srcp != &src || !src.complement_ready()) return 0;
+        int64_t n = 0;
+        for (const size_t i : refilled) {
+            const int64_t l = (int64_t) (i / (size_t) g.n_expert);
+            const int32_t e = (int32_t) (i % (size_t) g.n_expert);
+            if (host_res[i] < 0 || !src.has_resident(l, e)) continue;
+            int32_t in = -1;
+            float in_heat = 0.0f;
+            for (int32_t c = 0; c < (int32_t) g.n_expert; ++c) {
+                const size_t j = (size_t) l * (size_t) g.n_expert + (size_t) c;
+                if (host_res[j] >= 0 || src.has_resident(l, c) || helper_holds(l, c)) continue;
+                const float h = kvg_heat(j);
+                if (in < 0 || h > in_heat) { in = c; in_heat = h; }
+            }
+            if (in >= 0 && src.replace_resident(l, in, e)) ++n;
+        }
+        kvg.ram_freed += n;
+        return n;
+    };
     auto kvg_start = [&](int64_t top) {
         kvg.on = strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr && d_res != nullptr &&
                  !host_res.empty() && srcp != nullptr && top > kvg.floor;
@@ -7896,6 +7956,7 @@ int main(int argc, char** argv) {
         };
         const auto& lay = strata::kernels::cpu::expert_layout();
         int64_t gave = 0, moved = 0;
+        std::vector<int32_t> gone;   // residency indices the cache gave up, or moved into the loan region (kvg_ram_take)
         auto freeable = [&]() -> int64_t {   // mapped chunks wholly inside [lo, top): a chunk a live slot shares stays
             const int64_t c0 = (int64_t) ((xcache.slot_offset(kvg.lo) + G - 1) / G);
             const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
@@ -7931,10 +7992,12 @@ int main(int argc, char** argv) {
                         cold.pop_back();
                         host_res[(size_t) oi] = vs;
                         host_res[(size_t) vi] = strata::core::kNotResident;
+                        gone.push_back(oi);
                         ++moved;
                     }
                 }
                 if (vi < 0) host_res[(size_t) oi] = strata::core::kNotResident;
+                gone.push_back(vi >= 0 ? vi : oi);
                 ++kvg.evicted;
             }
         }
@@ -7966,11 +8029,14 @@ int main(int argc, char** argv) {
         kvg.fresh += fresh;
         kvg.cells = strata::core::qsa_kv_elastic_cells();
         ++kvg.grows;
+        const int64_t taken = kvg_ram_take(gone);
+        char ram_note[96] = "";
+        if (taken > 0) std::snprintf(ram_note, sizeof ram_note, "; %lld of those experts took colder ones' RAM places", (long long) taken);
         std::fprintf(stderr, "strata: K/V grown to %lld cells (%.2f GiB); the expert cache gave %lld slots for it, "
-                             "%lld hotter experts moved to colder ones' slots (%lld of %lld slots hold experts)%s\n",
+                             "%lld hotter experts moved to colder ones' slots (%lld of %lld slots hold experts)%s%s\n",
                      (long long) kvg.cells, (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
                      (long long) gave, (long long) moved, (long long) (kvg.lo + (xcache.slots() - kvg.top)),
-                     (long long) xcache.slots(),
+                     (long long) xcache.slots(), ram_note,
                      fresh > 0 ? " - and new VRAM, the cache being at its floor" : "");
         if (!ok)
             std::fprintf(stderr, "strata: the K/V could not grow to %lld cells (%s)\n", (long long) target,
@@ -8022,7 +8088,7 @@ int main(int argc, char** argv) {
             for (; pi < profile.size(); ++pi) {
                 const int32_t l = profile[pi].first, e = profile[pi].second;
                 const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
-                if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
+                if (host_res[i] >= 0 || lay.blob_bytes(l) > room || helper_holds(l, e)) continue;
                 const uint8_t* b = srcp->blob_stable(l, e);
                 if (b == nullptr) continue;
                 cudaMemcpyAsync(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice,
@@ -8043,8 +8109,14 @@ int main(int argc, char** argv) {
         for (const strata::core::VmmChunk h : kvg.spare) strata::core::vmm_chunk_free(h);   // new ones, if any
         kvg.spare.clear();
         ++kvg.trims;
+        std::vector<size_t> refill_idx;
+        refill_idx.reserve(filled.size());
+        for (const auto& f : filled) refill_idx.push_back(f.first);
+        const int64_t freed = kvg_ram_free(refill_idx);
+        char ram_note[96] = "";
+        if (freed > 0) std::snprintf(ram_note, sizeof ram_note, "; %lld RAM places given to experts no GPU holds", (long long) freed);
         std::fprintf(stderr, "strata: K/V trimmed to %lld cells; %lld slots back to the expert cache, refilled from "
-                             "the profile\n", (long long) kvg.cells, (long long) (kvg.lo - lo0));
+                             "the profile%s\n", (long long) kvg.cells, (long long) (kvg.lo - lo0), ram_note);
         return true;
     };
     // ---- the resident RAM mode (--resident-experts / --resident-cpu-experts): the experts the GPU cache does not
