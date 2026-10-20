@@ -8031,7 +8031,7 @@ int main(int argc, char** argv) {
         ++kvg.grows;
         const int64_t taken = kvg_ram_take(gone);
         char ram_note[96] = "";
-        if (taken > 0) std::snprintf(ram_note, sizeof ram_note, "; %lld of those experts took colder ones' RAM places", (long long) taken);
+        if (taken > 0) std::snprintf(ram_note, sizeof ram_note, "; %lld experts it gave up or moved took colder ones' RAM places", (long long) taken);
         std::fprintf(stderr, "strata: K/V grown to %lld cells (%.2f GiB); the expert cache gave %lld slots for it, "
                              "%lld hotter experts moved to colder ones' slots (%lld of %lld slots hold experts)%s%s\n",
                      (long long) kvg.cells, (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
