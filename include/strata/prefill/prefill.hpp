@@ -22,7 +22,7 @@
 #include <memory>
 #include <string>
 
-namespace strata::core { class PeerExperts; }
+namespace strata::core { class PeerExperts; class ExternalExperts; }
 namespace strata::kernels::cpu { class ExpertPool; }
 
 namespace strata::prefill {
@@ -37,6 +37,8 @@ struct PrefillStats {
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
     int64_t experts_direct = 0;     ///< ...of which MMQ read in their cache slots, not gathered (STRATA_MMQ_DIRECT=1)
     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
+    int64_t experts_helper = 0;     ///< expert-layer groups computed on the --external-experts helper (Phase 7.1)
+    int64_t experts_helper_cpu = 0; ///< ...of which the helper did not answer and the CPU pool computed
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
     double ms_ple = 0;
 };
@@ -246,10 +248,20 @@ public:
     /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
     static void arm_cpu_share(bool applies, bool by_default = false);
 
+    /// docs/plans/OPTION_A_EXCLUSIVE_RAM.md Phase 7.1 (--external-experts-prompt): the routed experts the helper card
+    /// holds (and this GPU does not) are computed THERE for every chunk, from the chunk's MoE input, and come back as
+    /// one weighted sum per token that the combine adds - instead of being read from the model files and streamed to
+    /// this GPU (exclusive mode keeps no RAM copy of them).  Only where the helper took the prompt kind for that layer,
+    /// on one GPU (no peer, no layer split), on the MMQ or FP16 expert path (not the fused one), without NVFP4 tails.
+    /// A request the helper does not answer is computed on the CPU pool from the files.  Not bit-identical to the
+    /// path without it (the helper's MMQ, the sums' order).  Set before `run`; null: off.
+    void set_external(core::ExternalExperts* external) { external_ = external; }
+
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
+    core::ExternalExperts* external_ = nullptr;      ///< set_external
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);

@@ -41,7 +41,7 @@ public:
     /// reason to load a model, so the engine is told before the pack is opened.
     static bool memory_info(int device, uint64_t& free_bytes, uint64_t& total_bytes, std::string& err);
 
-    /// Load the prefix of `assigned` this card can hold.  `loaded` comes back with the pairs that are resident, in
+    /// Load the prefix of `assigned` this card can hold (`reserve_bytes` less: Phase 7.1's prompt buffers).  `loaded` comes back with the pairs that are resident, in
     /// the order they were taken; the helper publishes those and only those.
     ///
     /// `shared_x` and `shared_rows` are the Request::x and Response::rows regions of the engine's mapping as this
@@ -51,7 +51,7 @@ public:
     bool open(int device, uint64_t vram_budget_bytes, int64_t n_layers, int64_t n_expert,
               const std::vector<std::pair<int32_t, int32_t>>& assigned, strata::core::ExpertSource& source,
               void* shared_x, uint64_t shared_x_bytes, void* shared_rows, uint64_t shared_rows_bytes,
-              std::vector<std::pair<int32_t, int32_t>>& loaded, std::string& err);
+              std::vector<std::pair<int32_t, int32_t>>& loaded, std::string& err, uint64_t reserve_bytes = 0);
     void close();
 
     /// One request: `n_entries` routed entries of `layer`, entry j belonging to expert[j], activations for n_tok
@@ -64,6 +64,11 @@ public:
     int64_t computed() const { return computed_; }
     int64_t requests() const { return requests_; }
     bool holds(int32_t layer, int32_t expert) const { return cache_.slot_of(layer, expert) >= 0; }
+    /// The device address of (layer, expert)'s blob in this card's cache, or null when it is not held.
+    const uint8_t* slot_ptr(int32_t layer, int32_t expert) const {
+        const int32_t s = cache_.slot_of(layer, expert);
+        return s < 0 ? nullptr : cache_.device_slot(s);
+    }
     double gib() const { return cache_.gib(); }
     uint64_t vram_free_bytes() const { return vram_free_; }
     uint64_t vram_total_bytes() const { return vram_total_; }

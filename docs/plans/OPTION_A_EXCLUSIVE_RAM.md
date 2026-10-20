@@ -546,6 +546,17 @@ warm-up, and completes the robustness run. Speed numbers are reported whatever t
    `RemoteExpertOpt` "reduce" mode in `remote_expert_opt.hpp` is the existing pattern) so the return is
    `n_tok x H` floats, not `rows x H`. At 8,192 tokens that is ~84 MB each way per layer: ~43 ms per layer on x4 Gen3,
    ~11 ms on x8 Gen4. Compare with reading the same experts from the SSD before building.
+
+   **Status (2026-10-20, branch `xhelper/p7-prompt`): built, not measured yet.** Opt-in, `--external-experts-prompt N`
+   (tokens per request, e.g. 2048; default 0 keeps the prompt path as it was). Protocol version 2: a prompt request kind,
+   and a bulk region after the fixed 4 MiB of the mapping (x and the sums, N x 2560 floats each: 40 MiB at N = 2048).
+   The helper runs the prompt path's MMQ products on its own slots (`src/xhelper/helper_prompt.cpp`) and keeps their
+   buffers off its expert budget. The engine (`Prefill::set_external`) holds a lease on the helper for each chunk,
+   leaves the helper's experts out of a streamed chunk's stream and out of a staged chunk's staging and CPU share,
+   lays their rows out last, sends the requests from a thread while the RTX runs its own experts, and adds the sums in
+   the combine (`moe_combine_peer`). A request the helper does not answer is computed on the CPU pool from the files.
+   Measured motive, from the live server's log on the B550 box (IQ3_S, 256K, exclusive): agent turns of 100-1400 new
+   tokens took 13-34 s, and one 361-token turn read 21.8 GB from the SSD for 19.1 GB of expert reads.
 2. **Adaptive helper tier**, batched: every `--adapt-every` windows, swap the most-routed CPU experts into the
    helper's least-used slots (same hysteresis and decay rules as the primary, `generate.cpp:7640-7660`), at most
    `--external-adapt-swaps` per round, one batched request carrying the blobs, applied between windows. In exclusive

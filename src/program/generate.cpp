@@ -563,6 +563,8 @@ struct Options {
     int external_experts_device = 0;      ///< HIP device index for the helper
     double external_experts_gib = 0;      ///< VRAM budget on the helper; 0 = its free VRAM minus headroom
     std::string external_experts_ram = "exclusive";   ///< exclusive: the helper's experts leave the RAM copy
+    /// Phase 7.1, opt-in: the helper computes its experts' prompt rows too, up to N tokens a request (0 = off)
+    int external_experts_prompt = 0;
     bool expert_cache_cpu_order = false;
     /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
     /// The default policy hands out slots in arrival order from one counter shared by all 48 layers, so the
@@ -1002,6 +1004,9 @@ void usage() {
                  "  --external-experts-gib X  VRAM the helper fills (default 0: what is free)\n"
                  "  --external-experts-ram exclusive|inclusive  leave the helper's experts out of the RAM\n"
                  "                       copy, or keep them in it too (default: exclusive)\n"
+                 "  --external-experts-prompt N  opt-in: the helper also computes its experts for prompt\n"
+                 "                       chunks, up to N tokens a request (e.g. 2048), instead of the prompt\n"
+                 "                       path reading them from the model files (default 0: off)\n"
                  "  --peer-device N      a second GPU as an adaptive expert-cache tier (rows over P2P; it also\n"
                  "                       computes its experts' prompt rows).  Not with --layer-split or\n"
                  "                       --expert-cache-device1..3.  Default output unchanged without it.\n"
@@ -2568,6 +2573,7 @@ int main(int argc, char** argv) {
         else if (a == "--external-experts-device") o.external_experts_device = std::atoi(next("--external-experts-device"));
         else if (a == "--external-experts-gib") o.external_experts_gib = std::atof(next("--external-experts-gib"));
         else if (a == "--external-experts-ram") o.external_experts_ram = next("--external-experts-ram");
+        else if (a == "--external-experts-prompt") o.external_experts_prompt = std::atoi(next("--external-experts-prompt"));
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
         else if (a == "--vram-reserve-later-mib")
             o.vram_reserve_later_mib = std::atoi(next("--vram-reserve-later-mib"));
@@ -3340,6 +3346,8 @@ int main(int argc, char** argv) {
         const char* why = o.external_experts_ram != "exclusive" && o.external_experts_ram != "inclusive"
                               ? "--external-experts-ram must be exclusive or inclusive"
                         : o.external_experts_device < 0 || o.external_experts_gib < 0 ? "a negative helper device or budget"
+                        : o.external_experts_prompt < 0 || o.external_experts_prompt > 16384
+                            ? "--external-experts-prompt takes 0 (off) to 16384 tokens"
                         : o.expert_cache_remote[0] > 0 ? "not with --expert-cache-device1..3"
                         : o.remote_expert_opt ? "not with --remote-expert-opt"
                         : o.peer_device >= 1 ? "not with --peer-device"
@@ -6720,6 +6728,8 @@ int main(int argc, char** argv) {
         xo.timeout_ms = (int) env_u("STRATA_XH_TIMEOUT_MS", 2000);
         xo.give_up_ms = (int) env_u("STRATA_XH_GIVE_UP_MS", 60000);
         xo.trace = env_u("STRATA_XH_TRACE", 0) != 0;
+        xo.prompt_tok = (uint32_t) o.external_experts_prompt;
+        xo.prompt_timeout_ms = (int) env_u("STRATA_XH_PROMPT_TIMEOUT_MS", 30000);
         if (!external.open(xo, o.pack, o.native_preset, g.n_layers, g.n_expert, ranked, xcache, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -6729,6 +6739,17 @@ int main(int argc, char** argv) {
                      o.external_experts_device, (long long) external.loaded().size(), external.gib(), external.load_seconds(),
                      (long long) xcache.slots(), (long long) (xcache.slots() + (int64_t) external.loaded().size()),
                      (long long) (g.n_layers * g.n_expert), xo.inclusive_ram ? "inclusive (keeps them too)" : "exclusive (leaves them out)");
+        if (xo.prompt_tok > 0) {
+            int64_t n = 0;
+            for (int64_t l = 0; l < g.n_layers; ++l) n += external.prompt_layer(l) ? 1 : 0;
+            if (external.prompt_enabled())
+                std::fprintf(stderr, "strata generate: external helper: prompt products on %lld of %lld layers, up to %u "
+                                     "tokens a request (--external-experts-prompt)\n",
+                             (long long) n, (long long) g.n_layers, external.prompt_max_tok());
+            else
+                std::fprintf(stderr, "strata generate: external helper: the prompt kind is off (the helper declined it; "
+                                     "its log says why): prompts read its experts from the model files\n");
+        }
     }
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
@@ -8763,6 +8784,7 @@ int main(int argc, char** argv) {
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
             if (share_pool) sp.set_cpu_pool(&pool);
+            if (!multi_gpu && external.prompt_enabled()) sp.set_external(&external);   // --external-experts-prompt
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -12445,6 +12467,9 @@ int main(int argc, char** argv) {
             const int64_t x_rows0 = external.computed(), x_layers0 = external.launched_layers(),
                           x_timeouts0 = external.timeouts(), x_waited0 = external.waited_layers();
             const double x_begin0 = external.ms_begin(), x_wait0 = external.ms_wait();
+            const int64_t x_preq0 = external.prompt_requests(), x_prows0 = external.prompt_rows(),
+                          x_pfail0 = external.prompt_failed();
+            const double x_pms0 = external.prompt_ms();
             const int64_t unpinned0 = drive.d.pool_unpinned_blobs;
             const int64_t cpu_entries0 = drive.d.multi_entries;
             cur = ids;
@@ -15633,6 +15658,10 @@ int main(int argc, char** argv) {
                              (long long) (external.waited_layers() - x_waited0), (long long) (external.timeouts() - x_timeouts0),
                              (long long) (drive.d.multi_entries - cpu_entries0), external.alive() ? "" : " (the helper has stopped)");
                 if (traced) std::fprintf(stderr, "; round trip p50 %.0f us p99 %.0f us over %lld layers", p50, p99, (long long) trips);
+                if (external.prompt_enabled() || external.prompt_requests() > x_preq0 || external.prompt_failed() > x_pfail0)
+                    std::fprintf(stderr, "; prompt %lld requests, %lld rows, %.1f ms waited, %lld not answered (the CPU computed them)",
+                                 (long long) (external.prompt_requests() - x_preq0), (long long) (external.prompt_rows() - x_prows0),
+                                 external.prompt_ms() - x_pms0, (long long) (external.prompt_failed() - x_pfail0));
                 std::fprintf(stderr, "\n");
             }
         }
@@ -15732,6 +15761,7 @@ int main(int argc, char** argv) {
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
         if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
+        if (!multi_gpu && external.prompt_enabled()) prefill.set_external(&external);   // --external-experts-prompt
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {

@@ -51,6 +51,11 @@ bool ExternalExperts::finish(float*, std::string&) { return true; }
 bool ExternalExperts::take_round_trips(double&, double&, int64_t&) { return false; }
 bool ExternalExperts::settle_stale() { return true; }
 void ExternalExperts::fail(const std::string&) {}
+bool ExternalExperts::prompt_acquire() { return false; }
+void ExternalExperts::prompt_release() {}
+bool ExternalExperts::prompt_ready() { return false; }
+bool ExternalExperts::prompt_begin(int64_t, int32_t, int32_t, int32_t) { return false; }
+bool ExternalExperts::prompt_finish(std::string& err) { err = "external experts: no prompt kind in this build"; return false; }
 
 #else
 
@@ -83,14 +88,17 @@ bool ExternalExperts::open(const Options& opt, const std::string& pack, const st
         return false;
     }
 
+    // Phase 7.1: with the prompt kind the bulk region follows the fixed 4 MiB (protocol.hpp's bulk layout)
+    prompt_tok_ = std::min<uint32_t>(opt.prompt_tok, xh::kMaxPromptTok);
+    mapped_bytes_ = xh::kMappingBytes + (prompt_tok_ ? xh::bulk_layout(prompt_tok_, (uint32_t) experts).total_bytes : 0);
     fd_ = (int) syscall(SYS_memfd_create, "strata-xhelper", 0);   // no MFD_CLOEXEC: the helper inherits it
     if (fd_ < 0) { err = std::string("external experts: memfd_create: ") + std::strerror(errno); return false; }
-    if (ftruncate(fd_, (off_t) xh::kMappingBytes) != 0) {
+    if (ftruncate(fd_, (off_t) mapped_bytes_) != 0) {
         err = std::string("external experts: ftruncate: ") + std::strerror(errno);
         close();
         return false;
     }
-    base_ = mmap(nullptr, xh::kMappingBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+    base_ = mmap(nullptr, mapped_bytes_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
     if (base_ == MAP_FAILED) {
         base_ = nullptr;
         err = std::string("external experts: mmap: ") + std::strerror(errno);
@@ -98,11 +106,21 @@ bool ExternalExperts::open(const Options& opt, const std::string& pack, const st
         return false;
     }
     hdr_ = reinterpret_cast<xh::Header*> (base_);
-    if (!xh::init_header(*hdr_, (uint32_t) layers, (uint32_t) experts, xh::kMappingBytes, pack.c_str(),
-                         native_preset.c_str())) {
+    if (!xh::init_header(*hdr_, (uint32_t) layers, (uint32_t) experts, mapped_bytes_, pack.c_str(),
+                         native_preset.c_str()) ||
+        (prompt_tok_ && !xh::init_bulk(*hdr_, prompt_tok_, mapped_bytes_))) {
         err = "external experts: the pack path or the geometry does not fit the shared header";
         close();
         return false;
+    }
+    if (prompt_tok_) {
+        const xh::BulkLayout b = xh::bulk_layout(prompt_tok_, (uint32_t) experts);
+        px_ = xh::bulk_at<float>(base_, *hdr_, b.x_off);
+        psum_ = xh::bulk_at<float>(base_, *hdr_, b.sum_off);
+        pw_ = xh::bulk_at<float>(base_, *hdr_, b.w_off);
+        ppair_ = xh::bulk_at<int32_t>(base_, *hdr_, b.pair_off);
+        pexp_ = xh::bulk_at<int32_t>(base_, *hdr_, b.expert_off);
+        pcount_ = xh::bulk_at<int32_t>(base_, *hdr_, b.count_off);
     }
     req_ = xh::request_at(base_, hdr_->request_off);
     res_ = xh::response_at(base_, hdr_->response_off);
@@ -196,6 +214,13 @@ bool ExternalExperts::open(const Options& opt, const std::string& pack, const st
         loaded_bytes_ += (uint64_t) lay.blob_bytes(p.layer);
     }
     if (loaded_.empty()) { err = "external experts: the helper is ready but loaded nothing"; close(); return false; }
+    prompt_layers_.assign((size_t) layers, 0);
+    prompt_ok_ = false;
+    if (prompt_tok_ && hdr_->prompt_ok) {
+        for (int64_t l = 0; l < layers && l < (int64_t) xh::kMaxLayers; ++l)
+            prompt_layers_[(size_t) l] = hdr_->prompt_layers[l] && layers_present_[(size_t) l] ? 1 : 0;
+        prompt_ok_ = std::count(prompt_layers_.begin(), prompt_layers_.end(), 1) > 0;
+    }
     owned_.assign((size_t) CAP, 0);
     alive_ = true;
     valid_ = true;
@@ -209,6 +234,10 @@ void ExternalExperts::close() {
     valid_ = false;
     pending_ = false;
     stale_ = false;
+    prompt_ok_ = false;
+    prompt_pending_ = false;
+    px_ = psum_ = pw_ = nullptr;
+    ppair_ = pexp_ = pcount_ = nullptr;
     if (hdr_ != nullptr) {
         hdr_->engine_state.store((uint32_t) xh::EngineState::Shutdown, std::memory_order_release);
         xh::wake_always(&req_->seq);
@@ -227,7 +256,7 @@ void ExternalExperts::close() {
         }
         pid_ = -1;
     }
-    if (base_ != nullptr) munmap(base_, xh::kMappingBytes);
+    if (base_ != nullptr) munmap(base_, mapped_bytes_);
     if (fd_ >= 0) ::close(fd_);
     base_ = nullptr;
     fd_ = -1;
@@ -269,6 +298,12 @@ bool ExternalExperts::begin(int64_t layer, const float* x, const int32_t* ids, i
         ++m;
     }
     if (m == 0) return true;
+    int idle = 0;
+    if (!slot_.compare_exchange_strong(idle, 1, std::memory_order_acq_rel)) {   // a prompt chunk holds the slot
+        std::fill(owned_.begin(), owned_.begin() + n, 0);
+        return true;
+    }
+    req_->kind = xh::kKindRows;
     req_->layer = (int32_t) layer;
     req_->n_tok = (int32_t) n_tok;
     req_->n_entries = m;
@@ -288,6 +323,7 @@ bool ExternalExperts::begin(int64_t layer, const float* x, const int32_t* ids, i
 bool ExternalExperts::finish(float* out, std::string& err) {
     if (!pending_) return true;
     pending_ = false;
+    struct SlotFree { std::atomic<int>& s; ~SlotFree() { s.store(0, std::memory_order_release); } } slot_free{slot_};
     const auto w0 = std::chrono::steady_clock::now();
     const uint32_t want = seq_;
     if (res_->seq.load(std::memory_order_acquire) != want) ++waited_layers_;
@@ -359,6 +395,96 @@ bool ExternalExperts::settle_stale() {
         fail("no answer for " + std::to_string(opt_.give_up_ms / 1000) + " s");
     }
     return false;
+}
+
+bool ExternalExperts::prompt_acquire() {
+    if (!prompt_ok_ || !alive_) return false;
+    if (stale_ && !settle_stale()) return false;
+    int idle = 0;
+    return slot_.compare_exchange_strong(idle, 2, std::memory_order_acq_rel);
+}
+
+void ExternalExperts::prompt_release() {
+    int lease = 2;
+    slot_.compare_exchange_strong(lease, 0, std::memory_order_acq_rel);
+}
+
+bool ExternalExperts::prompt_ready() {
+    if (slot_.load(std::memory_order_acquire) != 2 || !alive_ || !prompt_ok_) return false;
+    return !stale_ || settle_stale();   // the late answer is not there yet: the caller computes this one
+}
+
+bool ExternalExperts::prompt_begin(int64_t layer, int32_t n_tok, int32_t n_exp, int32_t n_rows) {
+    prompt_pending_ = false;
+    if (!prompt_ready() || !prompt_layer(layer)) return false;
+    if (n_tok <= 0 || (uint32_t) n_tok > prompt_tok_ || n_exp <= 0 || n_exp > n_expert_ || n_rows <= 0 ||
+        n_rows > n_tok * xh::kK)
+        return false;
+    req_->kind = xh::kKindPrompt;
+    req_->layer = (int32_t) layer;
+    req_->n_tok = n_tok;
+    req_->n_entries = n_exp;
+    req_->n_rows = n_rows;
+    ++seq_;
+    sent_ns_ = xh::monotonic_ns();
+    req_->seq.store(seq_, std::memory_order_release);
+    xh::wake_if_parked(&req_->seq, &req_->helper_sleeping);
+    prompt_pending_ = true;
+    prompt_rows_pending_ = n_rows;
+    pending_layer_ = layer;
+    return true;
+}
+
+bool ExternalExperts::prompt_finish(std::string& err) {
+    if (!prompt_pending_) { err = "external experts: no prompt request in flight"; return false; }
+    prompt_pending_ = false;
+    const auto w0 = std::chrono::steady_clock::now();
+    const uint32_t want = seq_;
+    const uint64_t deadline = xh::monotonic_ns() + (uint64_t) opt_.prompt_timeout_ms * 1000000ull;
+    bool answered = false;
+    while (!answered) {   // as finish(): slices of 100 ms, so a helper that died is noticed before the deadline
+        const uint64_t now = xh::monotonic_ns();
+        if (now >= deadline) break;
+        answered = xh::wait_until(&res_->seq, &res_->engine_sleeping, opt_.spin_us, std::min<uint64_t>(deadline, now + 100000000ull),
+                                  [want] (uint32_t v) { return v == want; });
+        if (!answered && pid_ > 0) {
+            int status = 0;
+            if (waitpid(pid_, &status, WNOHANG) == pid_) { pid_ = -1; break; }
+        }
+    }
+    const uint64_t seen_ns = xh::monotonic_ns();
+    prompt_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+    const std::string at = " (prompt, layer " + std::to_string(pending_layer_) + ")";
+    if (!answered) {
+        ++timeouts_;
+        ++prompt_failed_;
+        if (pid_ < 0) {
+            fail("the helper process exited");
+            err = "external experts: the helper process exited" + at;
+            return false;
+        }
+        if (!stale_) {
+            stale_ = true;
+            stale_since_ns_ = seen_ns - (uint64_t) opt_.prompt_timeout_ms * 1000000ull;
+            ++stalls_;
+            std::fprintf(stderr, "strata: external experts: no answer within %d ms%s; the CPU computes the helper's "
+                                 "rows until it answers\n", opt_.prompt_timeout_ms, at.c_str());
+        }
+        err = "external experts: no answer within " + std::to_string(opt_.prompt_timeout_ms) + " ms" + at;
+        return false;
+    }
+    if (res_->status != xh::kStatusOk || res_->n_rows != prompt_rows_pending_) {
+        // The helper turned its prompt kind off (it keeps answering decode's rows): so does the engine.
+        ++prompt_failed_;
+        prompt_ok_ = false;
+        err = std::string("external experts: the helper's prompt products failed") +
+              (hdr_->error[0] ? std::string(": ") + hdr_->error : std::string()) + at;
+        std::fprintf(stderr, "strata: %s; prompts read its experts from the model files from now on\n", err.c_str());
+        return false;
+    }
+    ++prompt_requests_;   // (not in the round-trip trace: that is decode's per-layer latency)
+    prompt_rows_ += prompt_rows_pending_;
+    return true;
 }
 
 bool ExternalExperts::take_round_trips(double& p50_us, double& p99_us, int64_t& count) {

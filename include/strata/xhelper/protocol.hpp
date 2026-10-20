@@ -44,7 +44,7 @@
 namespace strata::xhelper {
 
 inline constexpr uint64_t kMagic = 0x31504C484B525453ull;   // "STRKHLP1" read little-endian
-inline constexpr uint32_t kVersion = 1;
+inline constexpr uint32_t kVersion = 2;   // 2: the prompt kind and the bulk region (Phase 7.1)
 
 inline constexpr int kH = 2560;              // n_embd: strata::kernels::cpu::H
 inline constexpr int kMaxTok = 8;            // strata::kernels::cpu::MAXT
@@ -59,10 +59,18 @@ inline constexpr uint64_t kHeartbeatIdleNs = 100ull * 1000000ull;
 inline constexpr uint64_t kHelperDeadAfterNs = 5ull * 1000000000ull;
 
 // One mapping holds the header, both pair arrays, the request and the response.  For a 48 x 512 model that is about
-// 1.3 MiB; 4 MiB is what both sides allocate, with room for a bigger pair table.
+// 1.3 MiB; 4 MiB is what both sides allocate, with room for a bigger pair table.  With the prompt kind on, the bulk
+// region (bulk_layout below) follows at kMappingBytes, so the mapping is kMappingBytes + bulk_bytes.
 inline constexpr uint64_t kMiB = 1048576ull;
 inline constexpr uint64_t kMappingBytes = 4ull * kMiB;
 inline constexpr uint64_t kCacheLine = 64;
+inline constexpr uint64_t kPage = 4096;
+
+// Phase 7.1: a prompt layer's request.  The rows the helper holds are computed for up to bulk_max_tok tokens at a time
+// and come back as one weighted sum per token (n_tok x kH floats), not one row per routed pair: K times less over the
+// link, and the engine adds the sums in its combine.  A chunk longer than bulk_max_tok goes as several requests.
+enum : int32_t { kKindRows = 0, kKindPrompt = 1 };
+inline constexpr uint32_t kMaxPromptTok = 16384;
 
 enum class EngineState : uint32_t { Init = 0, Assigned = 1, Running = 2, Shutdown = 3 };
 enum class HelperState : uint32_t { Starting = 0, Loading = 1, Ready = 2, Failed = 3, Exited = 4 };
@@ -82,6 +90,11 @@ struct alignas(64) Header {
     char model_pack[1024];                       // the engine's --pack path
     char native_preset[1024];                    // the engine's --native argument, "" if none
     char error[512];                             // the helper's last fatal error, NUL-terminated
+    // Phase 7.1, the prompt kind: 0 bytes = off.  The engine sets them; the helper reserves its prompt buffers for
+    // bulk_max_tok tokens before it loads experts, and marks the layers whose prompt products it can run.
+    uint64_t bulk_off, bulk_bytes;
+    uint32_t bulk_max_tok, prompt_ok;            // prompt_ok: the helper set prompt_layers (0 = the prompt kind is off)
+    uint8_t prompt_layers[128];                  // [layer]: 1 = the helper runs this layer's prompt products (kMaxLayers)
 };
 
 struct Pair {
@@ -92,6 +105,8 @@ struct alignas(64) Request {   // engine -> helper; exactly one in flight
     std::atomic<uint32_t> seq;               // futex word; the engine increments it after writing the payload
     std::atomic<uint32_t> helper_sleeping;   // the helper sets 1 before FUTEX_WAIT, 0 after
     int32_t layer, n_tok, n_entries;
+    // kKindPrompt: the payload is in the bulk region; n_tok tokens, n_entries experts, n_rows routed rows (below)
+    int32_t kind, n_rows;
     int32_t entry[kCap];                     // index i into the n_tok * k routed list
     int32_t expert[kCap];                    // expert id of entry[j]
     alignas(64) float x[kMaxTok * kH];       // the activations of the n_tok tokens, as the CPU pool sees x_f
@@ -101,7 +116,7 @@ struct alignas(64) Response {   // helper -> engine
     std::atomic<uint32_t> seq;               // futex word; the helper sets it = Request::seq when done
     std::atomic<uint32_t> engine_sleeping;
     int32_t status;                          // kStatusOk, else see Header::error
-    int32_t n_rows;                          // == Request::n_entries on success
+    int32_t n_rows;                          // == Request::n_entries on success (kKindPrompt: == Request::n_rows)
     int32_t entry[kCap];                     // row r belongs to routed entry entry[r]
     alignas(64) float rows[kCap * kH];
 };
@@ -141,9 +156,36 @@ constexpr Layout layout_of(uint32_t n_layers, uint32_t n_expert) {
     return l;
 }
 
+// The bulk region, at Header::bulk_off: every array page-aligned (each side registers it with its GPU runtime).
+//   x      [max_tok * kH]  float  the request's tokens' MoE input (the prompt path's `mixed` rows)
+//   sum    [max_tok * kH]  float  the answer: per token, sum over its helper rows of weight * row
+//   w      [max_tok * kK]  float  the routing weights of the request's tokens, entry t * kK + k
+//   pair   [max_tok * kK]  int32  per helper row, its routed entry t * kK + k (t relative to the request), the
+//                                 rows of experts[0] first, then experts[1], ... (each expert's rows in token order)
+//   expert [n_expert]      int32  the request's experts, ascending
+//   count  [n_expert]      int32  their row counts
+struct BulkLayout {
+    uint64_t x_off, sum_off, w_off, pair_off, expert_off, count_off, total_bytes;
+};
+
+constexpr BulkLayout bulk_layout(uint32_t max_tok, uint32_t n_expert) {
+    BulkLayout b{};
+    const uint64_t rows = (uint64_t) max_tok * (uint64_t) kH * sizeof(float);
+    const uint64_t entries = (uint64_t) max_tok * (uint64_t) kK * 4ull;
+    b.x_off = 0;
+    b.sum_off = align_up(b.x_off + rows, kPage);
+    b.w_off = align_up(b.sum_off + rows, kPage);
+    b.pair_off = align_up(b.w_off + entries, kPage);
+    b.expert_off = align_up(b.pair_off + entries, kPage);
+    b.count_off = align_up(b.expert_off + (uint64_t) n_expert * 4ull, kPage);
+    b.total_bytes = align_up(b.count_off + (uint64_t) n_expert * 4ull, kPage);
+    return b;
+}
+
 // A 48 x 512 model is the biggest one the plan names (24576 pairs, 48 x 512 = 24576 experts).
 constexpr uint32_t kMaxLayers = 128;
 constexpr uint32_t kMaxExpert = 1024;
+static_assert(sizeof(Header::prompt_layers) == kMaxLayers, "one prompt flag per layer the protocol allows");
 static_assert(layout_of(48, 512).total_bytes <= kMappingBytes, "the plan's model fits the plan's 4 MiB mapping");
 static_assert(layout_of(48, 512).total_bytes / kMiB == 1, "about 1.3 MiB, as the plan says");
 
@@ -164,6 +206,11 @@ inline bool header_ok(const Header& h, uint64_t mapped_bytes) {
     if (h.request_off != l.request_off || h.response_off != l.response_off) return false;
     if (h.total_bytes < l.total_bytes) return false;
     if (h.n_assigned > l.pairs_capacity || h.n_loaded > l.pairs_capacity) return false;
+    if (h.bulk_bytes != 0) {   // the prompt kind: the bulk region right after the fixed part, the size its layout says
+        if (h.bulk_off != kMappingBytes || h.bulk_max_tok == 0 || h.bulk_max_tok > kMaxPromptTok) return false;
+        if (h.bulk_bytes != bulk_layout(h.bulk_max_tok, h.n_expert).total_bytes) return false;
+        if (h.bulk_off + h.bulk_bytes > mapped_bytes || h.bulk_off + h.bulk_bytes > h.total_bytes) return false;
+    }
     return true;
 }
 
@@ -203,6 +250,24 @@ inline bool init_header(Header& h, uint32_t n_layers, uint32_t n_expert, uint64_
         h.native_preset[sizeof(h.native_preset) - 1] = '\0';
     }
     h.error[0] = '\0';
+    h.bulk_off = 0;
+    h.bulk_bytes = 0;
+    h.bulk_max_tok = 0;
+    h.prompt_ok = 0;
+    for (auto& v : h.prompt_layers) v = 0;
+    return true;
+}
+
+/// The engine, after init_header and before the helper starts: turn the prompt kind on for `max_tok` tokens per
+/// request.  The mapping must be kMappingBytes + bulk_layout(max_tok, n_expert).total_bytes.
+inline bool init_bulk(Header& h, uint32_t max_tok, uint64_t mapped_bytes) {
+    if (max_tok == 0 || max_tok > kMaxPromptTok) return false;
+    const BulkLayout b = bulk_layout(max_tok, h.n_expert);
+    if (kMappingBytes + b.total_bytes > mapped_bytes) return false;
+    h.bulk_off = kMappingBytes;
+    h.bulk_bytes = b.total_bytes;
+    h.bulk_max_tok = max_tok;
+    h.total_bytes = mapped_bytes;
     return true;
 }
 
@@ -217,6 +282,10 @@ inline Request* request_at(void* base, uint64_t off) {
 }
 inline Response* response_at(void* base, uint64_t off) {
     return reinterpret_cast<Response*> (reinterpret_cast<char*> (base) + off);
+}
+template <class T>
+inline T* bulk_at(void* base, const Header& h, uint64_t off) {
+    return reinterpret_cast<T*> (reinterpret_cast<char*> (base) + h.bulk_off + off);
 }
 
 inline bool pair_ok(const Header& h, int32_t layer, int32_t expert) {

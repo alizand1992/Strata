@@ -113,7 +113,7 @@ void HelperTier::close() {
 bool HelperTier::open(int device, uint64_t vram_budget_bytes, int64_t n_layers, int64_t n_expert,
                       const std::vector<std::pair<int32_t, int32_t>>& assigned, strata::core::ExpertSource& source,
                       void* shared_x, uint64_t shared_x_bytes, void* shared_rows, uint64_t shared_rows_bytes,
-                      std::vector<std::pair<int32_t, int32_t>>& loaded, std::string& err) {
+                      std::vector<std::pair<int32_t, int32_t>>& loaded, std::string& err, uint64_t reserve_bytes) {
     close();
     loaded.clear();
     if (n_layers <= 0 || n_expert <= 0 || assigned.empty()) {
@@ -140,6 +140,7 @@ bool HelperTier::open(int device, uint64_t vram_budget_bytes, int64_t n_layers, 
     const uint64_t headroom = 512ull << 20;
     const uint64_t usable = vram_free_ > headroom ? vram_free_ - headroom : 0;
     budget_ = vram_budget_bytes ? std::min<uint64_t>(vram_budget_bytes, usable) : usable;
+    budget_ = budget_ > reserve_bytes ? budget_ - reserve_bytes : 0;   // the prompt buffers, allocated after this
     if (budget_ < (uint64_t) lay.max_blob) {
         err = "helper HIP: " + std::to_string(vram_free_ >> 20) + " MiB free leaves no room for one " +
               std::to_string(lay.max_blob >> 20) + " MiB expert after the " + std::to_string(headroom >> 20) +

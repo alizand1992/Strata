@@ -127,6 +127,53 @@ void test_header() {
     (void) saved_loaded;
 }
 
+// -------------------------------------------------------------------------------- the bulk region (Phase 7.1)
+void test_bulk() {
+    std::printf("\nthe prompt kind's bulk region\n");
+    const uint32_t tok = 2048;
+    const BulkLayout b = bulk_layout(tok, 512);
+    const uint64_t mapped = kMappingBytes + b.total_bytes;
+    std::vector<unsigned char> map(mapped + 64);
+    auto* base = reinterpret_cast<unsigned char*> ((reinterpret_cast<uintptr_t> (map.data()) + 63) / 64 * 64);
+    auto* h = reinterpret_cast<Header*> (base);
+    check(init_header(*h, 48, 512, mapped, "/models/qwen38/native", ""), "init_header on a mapping with room for the bulk");
+    check(h->bulk_bytes == 0 && h->prompt_ok == 0 && header_ok(*h, mapped), "the prompt kind starts off, and passes");
+    check(!init_bulk(*h, tok, kMappingBytes + b.total_bytes - 1), "init_bulk refuses a mapping one byte short");
+    check(!init_bulk(*h, 0, mapped) && !init_bulk(*h, kMaxPromptTok + 1, mapped), "and zero or too many tokens");
+    check(init_bulk(*h, tok, mapped) && header_ok(*h, mapped), "init_bulk turns it on, and the helper's check accepts it");
+    check(h->bulk_off == kMappingBytes && h->bulk_bytes == b.total_bytes, "the bulk region follows the fixed 4 MiB");
+    check(!header_ok(*h, mapped - 1), "a mapping smaller than the bulk region is refused");
+    h->bulk_bytes += kPage;
+    check(!header_ok(*h, mapped + kPage), "bulk bytes the layout does not give are refused");
+    h->bulk_bytes -= kPage;
+    h->bulk_off += kPage;
+    check(!header_ok(*h, mapped + kPage), "a bulk region somewhere else is refused");
+    h->bulk_off -= kPage;
+    h->bulk_max_tok = tok + 1;
+    check(!header_ok(*h, mapped), "a token count the size was not made for is refused");
+    h->bulk_max_tok = tok;
+    check(header_ok(*h, mapped), "and the untouched header still passes");
+
+    const uint64_t offs[] = {b.x_off, b.sum_off, b.w_off, b.pair_off, b.expert_off, b.count_off, b.total_bytes};
+    bool aligned = true, ordered = true;
+    for (size_t i = 0; i < 7; ++i) {
+        aligned = aligned && offs[i] % kPage == 0;
+        if (i > 0) ordered = ordered && offs[i] > offs[i - 1];
+    }
+    check(aligned && ordered, "every array page-aligned, in order, none empty");
+    check(b.sum_off - b.x_off >= (uint64_t) tok * kH * 4 && b.w_off - b.sum_off >= (uint64_t) tok * kH * 4 &&
+              b.pair_off - b.w_off >= (uint64_t) tok * kK * 4 && b.expert_off - b.pair_off >= (uint64_t) tok * kK * 4 &&
+              b.count_off - b.expert_off >= 512 * 4 && b.total_bytes - b.count_off >= 512 * 4,
+          "each array holds what the layout says it holds");
+    check(b.total_bytes / kMiB == 40, "2048 tokens: about 40 MiB (x and the sums, 20 MiB each)");
+    // the last element of each array is writable and lands inside the mapping
+    bulk_at<float>(base, *h, b.sum_off)[(size_t) tok * kH - 1] = 1.0f;
+    bulk_at<int32_t>(base, *h, b.count_off)[511] = 7;
+    check(bulk_at<int32_t>(base, *h, b.count_off)[511] == 7 &&
+              reinterpret_cast<unsigned char*> (bulk_at<int32_t>(base, *h, b.count_off) + 512) <= base + mapped,
+          "the arrays' ends are inside the mapping");
+}
+
 void test_heartbeat() {
     std::printf("\nthe helper's pulse\n");
     std::memset(g_map, 0, sizeof(g_map));
@@ -294,6 +341,7 @@ int main() {
                 (unsigned long long) kMappingBytes);
     test_sizes();
     test_header();
+    test_bulk();
     test_heartbeat();
     test_handoff();
     test_no_partner();

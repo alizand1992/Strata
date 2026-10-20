@@ -10,6 +10,7 @@
 //   mmap -> header_ok -> Loading -> FileExpertSource -> HelperTier::open -> publish the loaded pairs -> Ready
 //   -> wait on Request::seq -> HelperTier::run -> publish Response -> ... -> Exited.
 // Exit codes: 2 the mapping is not one this helper can use, 3 any other failure (model, VRAM, device), 0 a clean stop.
+#include "helper_prompt.hpp"
 #include "helper_tier.hpp"
 
 #include "strata/core/expert_source.hpp"
@@ -163,12 +164,19 @@ int main(int argc, char** argv) {
     log(opt, "device 0: %.2f GiB free of %.2f GiB", (double) free_bytes / 1073741824.0,
         (double) total_bytes / 1073741824.0);
 
+    // Phase 7.1: with the bulk region the engine asks for prompt layers too; their buffers come off the expert budget
+    const bool prompt_on = hdr->bulk_bytes != 0;
+    const uint64_t prompt_reserve = prompt_on ? HelperPrompt::bytes_needed(hdr->bulk_max_tok) : 0;
+    if (prompt_on)
+        log(opt, "prompt kind on: %u tokens a request, %llu MiB of device buffers kept off the expert budget",
+            hdr->bulk_max_tok, (unsigned long long) (prompt_reserve >> 20));
+
     HelperTier tier;
     std::vector<std::pair<int32_t, int32_t>> loaded;
     auto* req_x = reinterpret_cast<void*> (reinterpret_cast<char*> (req) + offsetof(Request, x));
     auto* res_rows = reinterpret_cast<void*> (reinterpret_cast<char*> (res) + offsetof(Response, rows));
     if (!tier.open(0, hdr->vram_budget_bytes, hdr->n_layers, hdr->n_expert, offered, source, req_x,
-                   sizeof(req->x), res_rows, sizeof(res->rows), loaded, err)) {
+                   sizeof(req->x), res_rows, sizeof(res->rows), loaded, err, prompt_reserve)) {
         std::snprintf(hdr->error, sizeof(hdr->error), "%.511s", err.c_str());
         hdr->helper_state.store((uint32_t) HelperState::Failed, std::memory_order_release);
         std::fprintf(stderr, "helper: loading the expert tier failed: %s\n", err.c_str());
@@ -178,6 +186,23 @@ int main(int argc, char** argv) {
     Pair* loaded_table = pairs_at(base, hdr->loaded_off);
     for (size_t i = 0; i < loaded.size(); ++i) loaded_table[i] = Pair{ loaded[i].first, loaded[i].second };
     hdr->n_loaded = (uint32_t) loaded.size();
+
+    // A prompt kind that cannot start is not fatal: the engine sees prompt_ok 0 and reads these experts as before.
+    HelperPrompt prompt;
+    hdr->prompt_ok = 0;
+    if (prompt_on) {
+        std::string perr;
+        if (prompt.open(0, hdr->bulk_max_tok, hdr->n_layers, hdr->n_expert, reinterpret_cast<char*> (base) + hdr->bulk_off,
+                        hdr->bulk_bytes, hdr->prompt_layers, perr)) {
+            hdr->prompt_ok = 1;
+            uint32_t n = 0;
+            for (uint32_t l = 0; l < hdr->n_layers; ++l) n += hdr->prompt_layers[l];
+            log(opt, "prompt products ready for %u of %u layers", n, hdr->n_layers);
+        } else {
+            for (auto& v : hdr->prompt_layers) v = 0;
+            std::fprintf(stderr, "helper: the prompt kind is off: %s\n", perr.c_str());
+        }
+    }
     bump_heartbeat(*hdr);
     hdr->helper_state.store((uint32_t) HelperState::Ready, std::memory_order_release);
     log(opt, "loaded %zu of %u offered experts (%.2f GiB of device slots), %s", loaded.size(), hdr->n_assigned,
@@ -206,7 +231,16 @@ int main(int argc, char** argv) {
         const int32_t layer = req->layer, n_tok = req->n_tok, n_entries = req->n_entries;
         int32_t n_rows = 0;
         bool ok = false;
-        if (layer < 0 || (uint32_t) layer >= hdr->n_layers || n_tok <= 0 || n_tok > kMaxTok || n_entries <= 0 ||
+        if (req->kind == kKindPrompt) {
+            if (layer < 0 || (uint32_t) layer >= hdr->n_layers || !hdr->prompt_layers[layer]) {
+                err = "helper: a prompt request for layer " + std::to_string(layer) + ", which it does not run";
+            } else {
+                ok = prompt.run(tier, layer, n_tok, n_entries, req->n_rows, err);
+                n_rows = ok ? req->n_rows : 0;
+            }
+        } else if (req->kind != kKindRows) {
+            err = "helper: a request of unknown kind " + std::to_string(req->kind);
+        } else if (layer < 0 || (uint32_t) layer >= hdr->n_layers || n_tok <= 0 || n_tok > kMaxTok || n_entries <= 0 ||
             n_entries > kCap) {
             err = "helper: a request outside the model or the window (layer " + std::to_string(layer) +
                   ", n_tok " + std::to_string(n_tok) + ", n_entries " + std::to_string(n_entries) + ")";
@@ -223,15 +257,26 @@ int main(int argc, char** argv) {
         res->seq.store(last, std::memory_order_release);
         wake_if_parked(&res->seq, &res->engine_sleeping);
         bump_heartbeat(*hdr);
-        if (ok && opt.verbose && (tier.requests() % 512) == 0)
+        if (ok && req->kind == kKindRows && opt.verbose && (tier.requests() % 512) == 0)
             log(opt, "answered %llu requests, %llu rows", (unsigned long long) tier.requests(),
                 (unsigned long long) tier.computed());
-        if (!ok) { exit_code = 3; break; }   // a device error is not a reason to keep pretending
+        // A failed prompt request turns the prompt kind off (the engine reads those experts as before) and leaves
+        // decode's rows to this helper; a failed decode request is a device error, and not a reason to keep pretending.
+        if (!ok && req->kind == kKindPrompt) {
+            std::fprintf(stderr, "helper: a prompt request failed, the prompt kind is off: %s\n", err.c_str());
+            prompt.close();
+            for (auto& v : hdr->prompt_layers) v = 0;
+            continue;
+        }
+        if (!ok) { exit_code = 3; break; }
     }
 
-    log(opt, "stopping after %llu requests (%.2f GiB held)", (unsigned long long) tier.requests(), tier.gib());
+    log(opt, "stopping after %llu requests (%.2f GiB held), %llu prompt requests (%llu rows)",
+        (unsigned long long) tier.requests(), tier.gib(), (unsigned long long) prompt.requests(),
+        (unsigned long long) prompt.rows());
     hdr->helper_state.store((uint32_t) HelperState::Exited, std::memory_order_release);
     bump_heartbeat(*hdr);
+    prompt.close();
     tier.close();
     source.close();
     munmap(base, mapped);
