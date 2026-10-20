@@ -1,11 +1,11 @@
 # Phase 7.1 - the helper in prompt processing
 
-Plan: [../OPTION_A_EXCLUSIVE_RAM.md](../OPTION_A_EXCLUSIVE_RAM.md), Phase 7.1. Branch `xhelper/p7-prompt`. Box: the B550
+Plan: [../OPTION_A_EXCLUSIVE_RAM.md](../OPTION_A_EXCLUSIVE_RAM.md), Phase 7.1 (merged into `main` at `9dbaa13a`). Box: the B550
 box of [00-baseline.md](00-baseline.md) (Ryzen 9 3900X, 32 GB DDR4; RTX 5060 Ti 16 GB for the engine, RX 9060 XT 16 GB
 on the chipset's x4 Gen3 link for the helper). Date: 2026-10-20.
 
 Config: the live server's (`strata-iq3_s-2gpu.json`): IQ3_S, `--resident-experts --spec 4 --mtp --kv int8`,
-`--max-context 262144`, helper exclusive. Both arms use the same build of this branch (`build-p7-cuda`, `build-p7-hip`);
+`--max-context 262144`, helper exclusive. Both arms use the same build of the branch (`build-p7-cuda`, `build-p7-hip`);
 "on" adds `--external-experts-prompt 2048` (and `STRATA_XH_TRACE=1`). One fresh server and one pass of the fixed prompt
 set each, same day, one after the other. Greedy.
 
@@ -40,3 +40,7 @@ file it was given, p5 makes the same `grep` tool call); they are not bit-identic
 
 Not tested: the CPU fallback when the helper stalls or exits mid-prompt (no stall happened in these runs), a real
 agent session (only the fixed prompt set), and other context sizes.
+
+Since 2026-10-20 the box's own server (`strata-iq3_s-2gpu.json`) runs with `--external-experts-prompt 2048`. Its first
+request after the restart (p4) read at 12.3 tok/s with 48 prompt requests and 0 not answered; this first request includes
+warming up and is not part of the table above.
