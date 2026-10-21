@@ -1326,11 +1326,13 @@ class StrataEngine:
             self.last.update(offloaded=int(f[15]))
         for tok in f[16:]:                                # key=value fields after the positional ones (the prompt's
             key, eq, value = tok.partition("=")           # first chunk and its streamed expert blobs)
-            if eq and key in ("chunk", "experts_streamed"):
+            if eq and key in ("chunk", "experts_streamed", "gpu_experts"):
                 try:
                     self.last[key] = int(value)
                 except ValueError:
                     pass
+        if "gpu_experts" in self.last and isinstance(getattr(self, "info", None), dict):
+            self.info["gpu_experts"] = self.last["gpu_experts"]   # the experts CUDA0 holds now (--kv-grow moves it)
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -3372,6 +3374,9 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
+    if external_helper_devices(cfg) and "STRATA_XH_STATS" not in env:
+        from serve.telemetry import helper_stats_path   # Option A: the helper's PCIe counters, for the Monitor
+        env["STRATA_XH_STATS"] = helper_stats_path()
     # Strict offline reaches children through the environment, because a tool subprocess or a model
     # loader is code this server does not own. Applied last so a profile's own `env` cannot remove
     # the policy by naming the same variable.
@@ -4353,13 +4358,14 @@ class Service:
     def start_telemetry(self):
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
-            from serve.telemetry import Telemetry
+            from serve.telemetry import Telemetry, helper_stats_path
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
                                        amd=getattr(self, "backend", None) == "hip",
-                                       helper_amd=getattr(self, "helper_amd", None))
+                                       helper_amd=getattr(self, "helper_amd", None),
+                                       helper_stats=helper_stats_path() if getattr(self, "helper_amd", None) else None)
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
                 # slow card keeps the GPU at work while the host thread sleeps)
@@ -4479,6 +4485,11 @@ class Service:
         engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
+        cards = (tel.get("now") or {}).get("gpus") or []
+        if any(c.get("helper") for c in cards) and engine.get("gpu_experts") is not None:
+            # Option A: the engine card's row says how many experts its cache holds (the helper's says its own)
+            tel = {**tel, "now": {**tel["now"], "gpus": [c if c.get("helper") else {**c, "experts": engine["gpu_experts"]}
+                                                         for c in cards]}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),

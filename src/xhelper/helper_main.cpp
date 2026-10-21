@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -81,6 +82,36 @@ void log(const Options& o, const char* fmt, ...) {
     std::fprintf(stderr, "\n");
     va_end(ap);
 }
+
+// STRATA_XH_STATS=<path> (the server sets it for the Monitor): the bytes this helper moves across its card's PCIe
+// link, counted from each request's own sizes (the activations in, the rows or the per-token sums out, the experts
+// uploaded at start), and the experts it holds.  The amdgpu driver has no PCIe traffic counter for every card
+// (RDNA4's sysfs has no pcie_bw), so this is the Monitor's "PCIe to / from card" for the helper.  Written at most once
+// a second, after the response is published, as one line of key=value through a rename (a reader never sees half).
+struct Stats {
+    std::string path, tmp;
+    uint64_t to_card = 0, from_card = 0, requests = 0, prompt_requests = 0, experts = 0;
+    uint64_t last_ns = 0;
+    explicit Stats(const char* p) : path(p != nullptr ? p : "") { if (!path.empty()) tmp = path + ".tmp"; }
+    void write(bool force = false) {
+        if (path.empty()) return;
+        const uint64_t now = monotonic_ns();
+        if (!force && now - last_ns < 1000000000ull) return;
+        last_ns = now;
+        char line[256];
+        const int n = std::snprintf(line, sizeof line,
+                                    "to_card_bytes=%llu from_card_bytes=%llu experts=%llu requests=%llu "
+                                    "prompt_requests=%llu t_ns=%llu\n",
+                                    (unsigned long long) to_card, (unsigned long long) from_card,
+                                    (unsigned long long) experts, (unsigned long long) requests,
+                                    (unsigned long long) prompt_requests, (unsigned long long) now);
+        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0) return;
+        const bool ok = n > 0 && ::write(fd, line, (size_t) n) == n;
+        ::close(fd);
+        if (ok) ::rename(tmp.c_str(), path.c_str());
+    }
+};
 
 }  // namespace
 
@@ -208,6 +239,11 @@ int main(int argc, char** argv) {
     log(opt, "loaded %zu of %u offered experts (%.2f GiB of device slots), %s", loaded.size(), hdr->n_assigned,
         tier.gib(), tier.zero_copy() ? "reading the mapping directly" : "staged through private pinned buffers");
 
+    Stats stats(std::getenv("STRATA_XH_STATS"));
+    stats.experts = loaded.size();
+    stats.to_card = (uint64_t) (tier.gib() * 1073741824.0);   // the experts' upload
+    stats.write(true);
+
     uint32_t last = 0;
     int exit_code = 0;
     for (;;) {
@@ -221,6 +257,7 @@ int main(int argc, char** argv) {
                 break;
             }
             bump_heartbeat(*hdr);   // idle: the engine's "older than 5 s is dead" rule needs a pulse
+            stats.write();
             continue;
         }
         last = req->seq.load(std::memory_order_acquire);
@@ -257,6 +294,20 @@ int main(int argc, char** argv) {
         res->seq.store(last, std::memory_order_release);
         wake_if_parked(&res->seq, &res->engine_sleeping);
         bump_heartbeat(*hdr);
+        if (ok) {
+            // a prompt request: x and the per-row weights and pairs in, one sum per token out; decode: x in, rows out
+            const uint64_t x_bytes = (uint64_t) n_tok * (uint64_t) kH * sizeof(float);
+            if (req->kind == kKindPrompt) {
+                stats.to_card += x_bytes + (uint64_t) n_rows * (sizeof(float) + sizeof(int32_t));
+                stats.from_card += x_bytes;
+                ++stats.prompt_requests;
+            } else {
+                stats.to_card += x_bytes;
+                stats.from_card += (uint64_t) n_rows * (uint64_t) kH * sizeof(float);
+                ++stats.requests;
+            }
+        }
+        stats.write();
         if (ok && req->kind == kKindRows && opt.verbose && (tier.requests() % 512) == 0)
             log(opt, "answered %llu requests, %llu rows", (unsigned long long) tier.requests(),
                 (unsigned long long) tier.computed());
@@ -276,6 +327,7 @@ int main(int argc, char** argv) {
         (unsigned long long) prompt.rows());
     hdr->helper_state.store((uint32_t) HelperState::Exited, std::memory_order_release);
     bump_heartbeat(*hdr);
+    if (!stats.path.empty()) ::unlink(stats.path.c_str());   // a stopped helper moves nothing: no stale reading
     prompt.close();
     tier.close();
     source.close();

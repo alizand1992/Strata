@@ -1,5 +1,6 @@
 // Option A: with an --external-experts helper card beside the engine's, the Monitor gets one row per card under the
-// eight tiles (which show the cards together): its role, load, VRAM, temperature, power and its own PCIe link.
+// eight tiles (which show the cards together): its role, the experts it holds, load, VRAM, temperature, power and its
+// own PCIe link.  The helper's PCIe traffic is its own count of what it moved (the driver has none on every card).
 // Its own file and its own /metrics poll, so app.js stays as upstream has it; index.html only loads it.
 "use strict";
 (() => {
@@ -13,7 +14,7 @@
   card.innerHTML = `
     <div class="req-head"><span class="card-title">Graphics cards</span><span class="muted small">each card on its own</span></div>
     <div class="table-wrap"><table class="st-table">
-      <thead><tr><th>Card</th><th>Role</th><th class="num">Load</th><th>VRAM</th><th class="num">Temp</th>
+      <thead><tr><th>Card</th><th>Role</th><th class="num">Experts</th><th class="num">Load</th><th>VRAM</th><th class="num">Temp</th>
         <th class="num">Power</th><th>PCIe link</th><th class="num">PCIe to / from card</th></tr></thead>
       <tbody></tbody></table></div>`;
   tiles.after(card);
@@ -50,6 +51,9 @@
       const name = cell(row, g.name || (g.helper ? "AMD card" : `GPU ${g.index}`));
       name.title = `device ${g.index}`;
       cell(row, g.helper ? "Expert helper" : "Engine", "muted");
+      // the engine card's: its expert cache after the last request (--kv-grow lends slots to the context)
+      cell(row, num(g.experts), "num").title = g.helper ? "experts this card holds and computes"
+        : "experts the engine's cache holds (after the last request)";
       cell(row, g.util == null ? "–" : `${num(g.util)}%`, "num");
       const vram = row.insertCell().appendChild(document.createElement("div"));
       vram.className = "vram";
@@ -65,7 +69,8 @@
       const gen = g.pcie_gen_max || g.pcie_gen;
       cell(row, gen ? `Gen${gen}${g.pcie_width ? ` x${g.pcie_width}` : ""}` +
                       (g.pcie_gen && g.pcie_gen < gen ? ` (idle Gen${g.pcie_gen})` : "") : "–");
-      cell(row, g.pcie_rx_mb == null && g.pcie_tx_mb == null ? "–" : `${mbs(g.pcie_rx_mb)} / ${mbs(g.pcie_tx_mb)}`, "num");
+      const io = cell(row, g.pcie_rx_mb == null && g.pcie_tx_mb == null ? "–" : `${mbs(g.pcie_rx_mb)} / ${mbs(g.pcie_tx_mb)}`, "num");
+      if (g.helper) io.title = "counted by the helper from its requests (the driver reports no PCIe traffic for this card)";
     }
   }
 

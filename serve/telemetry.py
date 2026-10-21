@@ -19,6 +19,7 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -142,9 +143,14 @@ class _Amd:
     interface: load (gpu_busy_percent), VRAM (mem_info_vram_used / _total), and from its hwmon folder the temperature
     (temp1_input, the edge sensor, m°C), power (power1_average or power1_input, µW) and its cap (power1_cap)."""
 
-    def __init__(self, index=0, sysfs=None):
+    def __init__(self, index=0, sysfs=None, stats=None):
         self.dev = amd_device_dir(index, sysfs)
         self.hwmon = None
+        # Option A: an --external-experts helper's own count of what it moved over this card's link (STRATA_XH_STATS,
+        # see helper_main.cpp), since the driver has no PCIe traffic counter on every card (RDNA4 has no pcie_bw)
+        self.stats = stats
+        self._stats_prev = None             # (t_ns, to_card, from_card, time read)
+        self._stats_rate = (None, None)
         if self.dev:
             try:
                 hw = sorted(os.listdir(os.path.join(self.dev, "hwmon")))
@@ -247,7 +253,39 @@ class _Amd:
             cap = self._int(os.path.join(self.hwmon, "power1_cap"))
             out["power_limit"] = cap / 1e6 if cap is not None else None
         out.update(self.link())
+        if self.stats:
+            out.update(self.helper_stats())
         return out
+
+    def helper_stats(self):
+        """The helper's PCIe traffic (MB/s to / from the card, from its byte counters' change between two readings
+        of its stats file) and the experts it holds; nothing while the file is not there (no helper running)."""
+        try:
+            with open(self.stats, encoding="utf-8") as f:
+                kv = dict(t.partition("=")[::2] for t in f.read().split())
+            t, to, fr = int(kv["t_ns"]), int(kv["to_card_bytes"]), int(kv["from_card_bytes"])
+            experts = int(kv.get("experts", 0))
+        except (OSError, ValueError, KeyError):
+            self._stats_prev, self._stats_rate = None, (None, None)
+            return {}
+        now = time.monotonic()
+        prev = self._stats_prev
+        if prev is None or t < prev[0] or to < prev[1] or fr < prev[2]:   # the first reading, or a new helper
+            self._stats_prev, self._stats_rate = (t, to, fr, now), (0.0, 0.0)
+        elif t > prev[0]:
+            dt = (t - prev[0]) / 1e9
+            self._stats_prev = (t, to, fr, now)
+            self._stats_rate = ((to - prev[1]) / dt / 2**20, (fr - prev[2]) / dt / 2**20)
+        elif now - prev[3] > 3.0:            # the helper writes at least once a second: a quiet file is a quiet link
+            self._stats_rate = (0.0, 0.0)
+        return {"pcie_rx_mb": self._stats_rate[0], "pcie_tx_mb": self._stats_rate[1], "experts": experts}
+
+
+def helper_stats_path(pid=None):
+    """Where an --external-experts helper started by this server writes its counters (STRATA_XH_STATS): /dev/shm on
+    Linux (no disk writes), else the temp folder; one file per server process."""
+    base = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else tempfile.gettempdir()
+    return os.path.join(base, "strata-xhelper-%d.stats" % (pid or os.getpid()))
 
 
 def metal_working_set():
@@ -529,13 +567,14 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, helper_amd=None):
+    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, helper_amd=None, helper_stats=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
         PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the AMD backend's
         cards, numbered as HIP numbers them, read from sysfs (#301).  `helper_amd`: the AMD cards an --external-experts
-        helper runs on beside a CUDA engine (HIP's numbering, sysfs); they count as more cards, named "hip<N>"."""
+        helper runs on beside a CUDA engine (HIP's numbering, sysfs); they count as more cards, named "hip<N>".
+        `helper_stats`: the helper's counter file (helper_stats_path), its PCIe traffic and experts held."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
@@ -544,7 +583,8 @@ class Telemetry:
         self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
         # Option A: the helper's AMD card is not the engine's, so it has its own name ("hip0" beside NVIDIA's 0)
-        self.helpers = [(f"hip{h}", r) for h in (helper_amd or []) if not amd for r in [_Amd(h)] if r.ok()]
+        self.helpers = [(f"hip{h}", r) for h in (helper_amd or []) if not amd for r in [_Amd(h, stats=helper_stats)]
+                        if r.ok()]
         self.gpus += self.helpers
         self.gpu = self.gpus[0][1]
         self.names = {i: g.name() for i, g in self.gpus} if self.helpers else {}   # the Monitor's per-card rows
@@ -627,7 +667,7 @@ class Telemetry:
                     for e, (_, r) in zip(s["gpus"], reads):     # each card's power cap and PCIe link
                         e["helper"] = e["index"] in names
                         e.update({k: r.get(k) for k in ("power_limit", "pcie_gen", "pcie_gen_max", "pcie_width",
-                                                        "pcie_rx_mb", "pcie_tx_mb")})
+                                                        "pcie_rx_mb", "pcie_tx_mb", "experts")})
             s.update({f"gpu_{k}": v for k, v in g.items()})
         if self.ps:
             try:

@@ -2910,6 +2910,10 @@ class CancelledRead(unittest.TestCase):
         StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 2 chunk=x other=1")
         self.assertNotIn("chunk", e.last)
         self.assertNotIn("other", e.last)
+        e.info = {"gpu_experts": 4455}                    # INFO's count at start; each DONE's replaces it
+        StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 2 chunk=8192 "
+                                    "experts_streamed=0 gpu_experts=3815")
+        self.assertEqual((e.last["gpu_experts"], e.info["gpu_experts"]), (3815, 3815))
 
     def test_request_stats_chunk_fields(self):
         """Across a request's continuations the streamed blobs add up; the chunk is the request's own read's."""
@@ -5055,6 +5059,37 @@ class AmdTelemetry(unittest.TestCase):
                 gone = telemetry.Telemetry(gpu_index=0, helper_amd=[5])         # no such AMD card: left out
                 self.assertEqual(gone.static["gpu_count"], 1)
                 gone.close()
+
+    def test_external_helper_stats_file(self):
+        """Option A: the helper's own byte counters (STRATA_XH_STATS) are the AMD card's PCIe traffic on the Monitor,
+        as MB/s between two readings, with the experts it holds; no file (no helper running) reads as nothing, and
+        the server hands the engine the file's path only with a helper."""
+        from serve import telemetry
+        from serve.server import child_env
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            stats = os.path.join(d, "xh.stats")
+            with mock.patch.object(telemetry, "SYSFS", d), mock.patch.object(telemetry.sys, "platform", "linux"):
+                r = telemetry._Amd(1, stats=stats)
+                self.assertNotIn("pcie_rx_mb", r.read())                       # the helper has not written yet
+
+                def put(t_s, to, fr):
+                    with open(stats, "w") as f:
+                        f.write(f"to_card_bytes={to} from_card_bytes={fr} experts=8019 requests=5 "
+                                f"prompt_requests=0 t_ns={int(t_s * 1e9)}\n")
+                put(10, 16 << 30, 0)                                           # the experts' upload, before Ready
+                first = r.read()
+                self.assertEqual((first["pcie_rx_mb"], first["pcie_tx_mb"], first["experts"]), (0.0, 0.0, 8019))
+                put(12, (16 << 30) + (40 << 20), 100 << 20)                   # 2 s later: 40 MiB in, 100 MiB out
+                second = r.read()
+                self.assertAlmostEqual(second["pcie_rx_mb"], 20.0)
+                self.assertAlmostEqual(second["pcie_tx_mb"], 50.0)
+                self.assertAlmostEqual(r.read()["pcie_rx_mb"], 20.0)          # the same file: the last rate stands
+                os.remove(stats)
+                self.assertNotIn("experts", r.read())                          # the helper stopped
+        helper = {"args": ["--native", "x.gguf", "--external-experts", "h"]}
+        self.assertTrue(child_env(helper)["STRATA_XH_STATS"].endswith("strata-xhelper-%d.stats" % os.getpid()))
+        self.assertNotIn("STRATA_XH_STATS", child_env({"args": ["--native", "x.gguf"]}))
 
     def test_free_vram_on_hip(self):
         from serve import telemetry
