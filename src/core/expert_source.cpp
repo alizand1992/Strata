@@ -5272,6 +5272,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     job_expert[nfb] = e;
                     d.jobs_multi[(size_t) nfb].blob = b;
                     d.jobs_multi[(size_t) nfb].nt = 0;
+                    d.jobs_multi[(size_t) nfb].fmt = nullptr;   // the layer's layout: not a zero-copy job's left over
                     ++nfb;
                 }
                 ExpertJobMulti& jb = d.jobs_multi[(size_t) j];
