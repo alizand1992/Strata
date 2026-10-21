@@ -83,7 +83,20 @@ rows until it answered); rebased had none. `--kv-grow` took the same steps in bo
 - Follow-up turns are even at 87K and 195K. At 20K the rebased arm was 5.5 s slower over six turns, almost all of it
   the first turn (11.8 s against 7.9 s); one pass does not say whether that is noise.
 - Which of upstream's commits the gains come from is not measured. Not tested: more than one pass per arm, a real agent
-  session, conversations switching back and forth, the CPU fallback after a helper stall on the rebased build.
+  session, conversations switching back and forth.
 
 The box's server runs `54df2d15` since 21:02 (`build-main-cuda`, `build-main-hip`, the same options; config backup
 `strata-iq3_s-2gpu.json.bak-rebase`).
+
+## The CPU fallback was broken by the rebase until `efcfdd88`
+
+When the helper does not answer within 2 s, the CPU computes its rows. Upstream's zero-copy GGUF experts (`c85cc6dd`,
+2026-10-18) added a layout field to each CPU job; the window path sets it per job, but this work's fallback did not,
+so it could use an earlier zero-copy job's offsets and read the wrong rows. On the box's server (`54df2d15`), two helper
+stalls hit it the same evening: at 23:16 the engine crashed (segfault in `ggml_vec_dot_iq4_nl_q8_0`, the server
+restarted it), and at 23:31 a reply ended after 929 tokens with non-finite logits (#879), cut off as "length" in the
+middle of a tool call. The A/B runs above had no stall on the rebased build, so they did not reach it.
+
+`efcfdd88` sets the field in the fallback. Checked on the box: the helper stopped with SIGSTOP for 3 s during a reply;
+the CPU computed its rows from layer 12 on, the reply finished, and the engine stayed up. The server runs it since
+23:33 (`build-fix-cuda`, the same options; config backup `strata-iq3_s-2gpu.json.bak-prefix`).
